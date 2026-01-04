@@ -37,8 +37,8 @@ AMD FSR 4.0 Frame Generation implementation for Skyrim Special Edition.
 
 ## 致谢 (Credits)
 参考并借鉴了以下项目的优秀实现：
-- [ENBFrameGeneration](https://github.com/PureDark/ENBFrameGeneration)
-- [enb-anti-aliasing](https://github.com/PureDark/enb-anti-aliasing)
+- [ENBFrameGeneration](https://github.com/doodlum/ENBFrameGeneration)
+- [enb-anti-aliasing](https://github.com/doodlum/enb-anti-aliasing)
 - [Skyrim-Upscaler](https://github.com/PureDark/Skyrim-Upscaler)
 
 ## 免责声明 (Disclaimer)
