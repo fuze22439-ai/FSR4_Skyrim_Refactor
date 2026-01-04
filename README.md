@@ -10,14 +10,19 @@ AMD FSR 4.0 Frame Generation implementation for Skyrim Special Edition.
 - **反向互操作 (Reverse Interop)**: 采用最稳定的 D3D12 资源共享方案，确保与 ENB 等插件的兼容性。
 - **精准同步**: 严格同步 FrameID 与相机抖动 (Jitter)，消除画面撕裂与拖影。
 
+## ⚠️ 当前核心问题 (Current Critical Issue)
+**目前插帧效果依然无效 (Interpolation Inactive)**。
+虽然 FSR 4.0 已成功加载且日志显示调度正常，但视觉上没有感知到流畅度提升。这可能是由于运动矢量 (Motion Vector) 极性、深度缓冲 (Depth) 兼容性或颜色空间不匹配导致的“静默回退”。**本项目目前仍处于攻克此问题的阶段。**
+
 ## 当前进度 (Current Progress)
 - [x] 基础 Proxy SwapChain 搭建
 - [x] FSR 4.0 上下文初始化
 - [x] 相机向量 (Camera Vectors) 映射修复
 - [x] Jitter 符号与缩放校正
 - [x] 资源屏障 (Resource Barriers) 优化
-- [ ] **进行中**: 解决插帧无效/静默回退问题
-- [ ] **进行中**: 运动矢量 (Motion Vector) 极性微调
+- [ ] **待解决 (CRITICAL)**: 解决插帧无效/静默回退问题
+- [ ] **待解决**: 运动矢量 (Motion Vector) 极性与缩放微调
+- [ ] **待解决**: 深度缓冲 (Depth) 极性对齐 (Standard vs Inverted)
 
 ## 技术细节 (Technical Details)
 - **开发环境**: Visual Studio 2022, CMake, Vcpkg
