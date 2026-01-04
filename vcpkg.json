@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "communityshaders",
+  "license": "GPL-3.0",
+  "features": {
+    "commonlibsse-ng": {
+      "description": "Dependencies of clib-ng",
+      "dependencies": ["catch2", "fmt", "directxtk", "rapidcsv", "spdlog"]
+    }
+  },
+  "default-features": ["commonlibsse-ng"],
+  "dependencies": [
+    "xbyak",
+    "clib-util"
+  ],
+  "builtin-baseline": "1dc5ee30eb1032221d29f281f4a94b73f06b4284"
+}

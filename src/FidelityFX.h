@@ -1,0 +1,41 @@
+#pragma once
+
+#include <ffx_api.h>
+#include <ffx_api.hpp>
+#include <ffx_upscale.h>
+#include <ffx_upscale.hpp>
+#include <dx12/ffx_api_dx12.h>
+#include <dx12/ffx_api_dx12.hpp>
+#include <ffx_framegeneration.h>
+#include <ffx_framegeneration.hpp>
+#include <dx12/ffx_api_framegeneration_dx12.h>
+#include <dx12/ffx_api_framegeneration_dx12.hpp>
+
+#include "Buffer.h"
+
+
+class FidelityFX
+{
+public:
+	static FidelityFX* GetSingleton()
+	{
+		static FidelityFX singleton;
+		return &singleton;
+	}
+
+	HMODULE module = nullptr;
+
+	ffx::Context swapChainContext{};
+	ffx::Context frameGenContext;
+	ffx::Context upscaleContext;
+
+	bool isAvailable = false;
+	bool upscaleInitialized = false;
+	bool frameGenInitialized = false;
+	bool swapChainContextInitialized = false;
+
+	void LoadFFX();
+	void SetupFrameGeneration();
+	void Present(bool a_useFrameGeneration, bool a_bypass = false);
+};
+
