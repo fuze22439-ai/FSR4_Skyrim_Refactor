@@ -109,7 +109,7 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 	if (shouldProxy && pSwapChainDesc) {
 		logger::info("[Frame Generation] Frame Generation enabled, using D3D12 proxy");
 		
-		auto fidelityFX = FidelityFX::GetSingleton();
+		auto fidelityFX = FSR4SkyrimHandler::GetSingleton();
 
 		if (fidelityFX->isAvailable) {
 			IDXGIFactory4* dxgiFactory = nullptr;
@@ -176,7 +176,7 @@ namespace Hooks
 {
 	void Install()
 	{
-		auto fidelityFX = FidelityFX::GetSingleton();
+		auto fidelityFX = FSR4SkyrimHandler::GetSingleton();
 		fidelityFX->LoadFFX();
 
 		*(uintptr_t*)&ptrD3D11CreateDeviceAndSwapChain = SKSE::PatchIAT(hk_D3D11CreateDeviceAndSwapChain, "d3d11.dll", "D3D11CreateDeviceAndSwapChain");

@@ -13,8 +13,17 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <d3dcompiler.h>
+
+#include <ENB/ENBSeriesAPI.h>
+
+#define LOG_FLUSH() spdlog::default_logger()->flush()
 
 using namespace std::literals;
+
+extern ENB_API::ENBSDKALT1001* g_ENB;
 
 namespace stl
 {
@@ -85,6 +94,8 @@ namespace util
 }
 
 #define DLLEXPORT __declspec(dllexport)
+
+#define LOG_FLUSH() spdlog::default_logger()->flush()
 
 #include "Plugin.h"
 
@@ -180,6 +191,22 @@ extern "C" DLLEXPORT bool SKSEAPI SKSEPlugin_Query(const SKSE::QueryInterface*, 
 
 namespace DX
 {
+	inline ID3D11Device* GetDevice()
+	{
+		auto renderer = RE::BSGraphics::Renderer::GetSingleton();
+		if (!renderer)
+			return nullptr;
+		return reinterpret_cast<ID3D11Device*>(renderer->data.forwarder);
+	}
+
+	inline ID3D11DeviceContext* GetContext()
+	{
+		auto renderer = RE::BSGraphics::Renderer::GetSingleton();
+		if (!renderer)
+			return nullptr;
+		return reinterpret_cast<ID3D11DeviceContext*>(renderer->data.context);
+	}
+
 	// Helper class for COM exceptions
 	class com_exception : public std::exception
 	{

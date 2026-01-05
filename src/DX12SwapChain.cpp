@@ -13,6 +13,7 @@ DX12SwapChain::DX12SwapChain()
 {
 	frameCounter = 0;
 	enbReady = false;
+	QueryPerformanceFrequency(&qpf);
 }
 
 void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
@@ -78,17 +79,17 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory4* a_dxgiFactory, DXGI_SWAP_CHAI
 	versionDesc.header.pNext = &backendDesc.header;
 	backendDesc.header.pNext = nullptr;
 
-	auto fidelityFX = FidelityFX::GetSingleton();
+	auto fidelityFX = FSR4SkyrimHandler::GetSingleton();
 
-	logger::info("[FidelityFX] Attempting to create swap chain context...");
-	logger::info("[FidelityFX] HWND: {:p}, Width: {}, Height: {}, Format: {}", (void*)a_swapChainDesc.OutputWindow, swapChainDesc.Width, swapChainDesc.Height, (int)swapChainDesc.Format);
+	logger::info("[FSR4SkyrimHandler] Attempting to create swap chain context...");
+	logger::info("[FSR4SkyrimHandler] HWND: {:p}, Width: {}, Height: {}, Format: {}", (void*)a_swapChainDesc.OutputWindow, swapChainDesc.Width, swapChainDesc.Height, (int)swapChainDesc.Format);
 
 	// Call the C API directly
 	auto ret = ffxCreateContext(&fidelityFX->swapChainContext, &ffxSwapChainDesc.header, nullptr);
 	if (ret != FFX_API_RETURN_OK) {
-		logger::critical("[FidelityFX] Failed to create swap chain context! Error code: 0x{:X}", (uint32_t)ret);
+		logger::critical("[FSR4SkyrimHandler] Failed to create swap chain context! Error code: 0x{:X}", (uint32_t)ret);
 	} else {
-		logger::info("[FidelityFX] Successfully created swap chain context.");
+		logger::info("[FSR4SkyrimHandler] Successfully created swap chain context.");
 		fidelityFX->swapChainContextInitialized = true;
 	}
 
@@ -208,7 +209,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// Frame Generation handles its own pacing, force SyncInterval to 0
 	SyncInterval = 0;
 
-	extern ::ENB_API::ENBSDKALT1001* g_ENB;
 	// Reduced wait frames for faster testing
 	uint64_t waitFrames = g_ENB ? 120 : 60;
 
@@ -229,12 +229,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			Flags |= DXGI_PRESENT_ALLOW_TEARING;
 		}
 
-		// Wait for D3D11 to finish
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Step 1: CopyBuffersToSharedResources");
-		}
-		upscaling_ptr->CopyBuffersToSharedResources();
-
 		// Stability Check: Wait for ENB compilation and resource initialization
 		bool enbIsCompiling = false;
 		if (g_ENB) {
@@ -243,7 +237,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			}
 		}
 
-		bool bypass = enbIsCompiling || frameCounter < waitFrames;
+		// FSR 4.0: We need to be very careful about when we stop bypassing.
+		// If we stop bypassing too early (while the game is still loading or transitioning),
+		// the camera/depth resources might be in an inconsistent state.
+		auto playerCamera = RE::PlayerCamera::GetSingleton();
+		bool cameraReady = playerCamera && playerCamera->cameraRoot;
+		bool bypass = enbIsCompiling || frameCounter < waitFrames || !upscaling_ptr->setupBuffers || !cameraReady;
+
+		// Wait for D3D11 to finish
+		if (shouldLog) {
+			logger::info("[DX12SwapChain] Step 1: CopyBuffersToSharedResources");
+		}
+		upscaling_ptr->CopyBuffersToSharedResources();
 
 		if (!d3d11Fence || !d3d12Fence || !swapChainBufferWrapped || !d3d11Context) {
 			if (shouldLog) {
@@ -290,39 +295,83 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			auto fakeSwapChain = swapChainBufferWrapped->resource.get();
 			// Use the ACTUAL swapchain index for the destination to avoid flickering
 			UINT actualIndex = swapChain->GetCurrentBackBufferIndex();
-			auto realSwapChain = swapChainBuffers[actualIndex].get();
 			
-			if (fakeSwapChain && realSwapChain) {
+			if (actualIndex < 3 && swapChainBuffers[actualIndex]) {
+				auto realSwapChain = swapChainBuffers[actualIndex].get();
+				
+				if (fakeSwapChain && realSwapChain) {
+					if (shouldLog) {
+						logger::info("[DX12SwapChain] Step 4: Resource Barriers & CopyResource (actualIndex: {})", actualIndex);
+					}
+					{
+						std::vector<D3D12_RESOURCE_BARRIER> barriers;
+						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
+						commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+					}
+
+					commandLists[frameIndex]->CopyResource(realSwapChain, fakeSwapChain);
+
+					{
+						std::vector<D3D12_RESOURCE_BARRIER> barriers;
+						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
+						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
+						commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+					}
+				}
+			} else {
 				if (shouldLog) {
-					logger::info("[DX12SwapChain] Step 4: Resource Barriers & CopyResource (actualIndex: {})", actualIndex);
-				}
-				{
-					std::vector<D3D12_RESOURCE_BARRIER> barriers;
-					barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
-					barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
-					commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-				}
-
-				commandLists[frameIndex]->CopyResource(realSwapChain, fakeSwapChain);
-
-				{
-					std::vector<D3D12_RESOURCE_BARRIER> barriers;
-					barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
-					barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
-					commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+					logger::warn("[DX12SwapChain] Step 4 Skipped: actualIndex {} out of bounds or buffer NULL", actualIndex);
 				}
 			}
 		}
 
+		// FSR 4.0: Transition shared resources to a state usable by FSR
+		if (upscaling_ptr->setupBuffers && !bypass) {
+			if (shouldLog) {
+				logger::info("[DX12SwapChain] Step 4.5: Transitioning shared resources for FSR");
+			}
+			std::vector<D3D12_RESOURCE_BARRIER> barriers;
+			if (upscaling_ptr->depthBufferShared && upscaling_ptr->depthBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->depthBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+			if (upscaling_ptr->motionVectorBufferShared && upscaling_ptr->motionVectorBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->motionVectorBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+			if (upscaling_ptr->HUDLessBufferShared && upscaling_ptr->HUDLessBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->HUDLessBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+			if (upscaling_ptr->upscaledBufferShared && upscaling_ptr->upscaledBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->upscaledBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+			
+			if (!barriers.empty())
+				commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+		}
+
 		if (upscaling_ptr->setupBuffers) {
 			if (shouldLog) {
-				logger::info("[DX12SwapChain] Step 5: FidelityFX Present (bypass: {})", bypass);
+				logger::info("[DX12SwapChain] Step 5: FSR4Handler Present (bypass: {})", bypass);
 			}
-			FidelityFX::GetSingleton()->Present(upscaling_ptr->settings.frameGenerationMode, bypass);
+			FSR4SkyrimHandler::GetSingleton()->Present(upscaling_ptr->settings.frameGenerationMode, bypass);
 		} else {
 			if (shouldLog) {
 				logger::info("[DX12SwapChain] Step 5 Skipped: setupBuffers is false");
 			}
+			// Even if setupBuffers is false, we should call Present with bypass=true to keep the scheduler alive
+			FSR4SkyrimHandler::GetSingleton()->Present(upscaling_ptr->settings.frameGenerationMode, true);
+		}
+
+		// FSR 4.0: Transition shared resources back to COMMON for D3D11 interop
+		if (upscaling_ptr->setupBuffers && !bypass) {
+			std::vector<D3D12_RESOURCE_BARRIER> barriers;
+			if (upscaling_ptr->depthBufferShared && upscaling_ptr->depthBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->depthBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
+			if (upscaling_ptr->motionVectorBufferShared && upscaling_ptr->motionVectorBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->motionVectorBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
+			if (upscaling_ptr->HUDLessBufferShared && upscaling_ptr->HUDLessBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->HUDLessBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
+			if (upscaling_ptr->upscaledBufferShared && upscaling_ptr->upscaledBufferShared->resource)
+				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->upscaledBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
+			
+			if (!barriers.empty())
+				commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
 		}
 
 		if (shouldLog) {

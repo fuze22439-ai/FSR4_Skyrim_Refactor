@@ -9,9 +9,6 @@
 
 #include <ClibUtil/simpleINI.hpp>
 
-#include <ENB/ENBSeriesAPI.h>
-extern ENB_API::ENBSDKALT1001* g_ENB;
-
 void Upscaling::LoadINI()
 {
 	std::lock_guard<std::shared_mutex> lk(fileLock);
@@ -139,7 +136,7 @@ void Upscaling::UpdateJitter()
 
 		auto gameViewport = reinterpret_cast<StateEx*>(state);
 
-		auto ffx = FidelityFX::GetSingleton();
+		auto ffx = FSR4SkyrimHandler::GetSingleton();
 		if (!ffx->upscaleInitialized)
 			return;
 
@@ -253,22 +250,20 @@ void Upscaling::CreateFrameGenerationResources()
 		// Find shader...
 		logger::info("[Upscaling] Compiling depth copy shader...");
 		LOG_FLUSH();
-		HMODULE hModule = NULL;
-		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			(LPCWSTR)&Upscaling::GetSingleton, &hModule);
-		wchar_t pluginPath[MAX_PATH];
-		GetModuleFileNameW(hModule, pluginPath, MAX_PATH);
-		std::wstring path(pluginPath);
-		size_t lastSlash = path.find_last_of(L"\\/");
-		std::wstring dir = (lastSlash != std::wstring::npos) ? path.substr(0, lastSlash) : L".";
 		
-		std::wstring dllName = path.substr(lastSlash + 1);
-		size_t dot = dllName.find_last_of(L".");
-		std::wstring folderName = (dot != std::wstring::npos) ? dllName.substr(0, dot) : dllName;
-		
-		std::wstring shaderPath = dir + L"\\" + folderName + L"\\CopyDepthToSharedBufferCS.hlsl";
+		// Use a more robust way to find the shader file
+		std::wstring shaderPath = L"Data/SKSE/Plugins/CopyDepthToSharedBufferCS.hlsl";
 		if (!std::filesystem::exists(shaderPath)) {
-			shaderPath = dir + L"\\CopyDepthToSharedBufferCS.hlsl";
+			shaderPath = L"Data/SKSE/Plugins/FSR4_Skyrim/CopyDepthToSharedBufferCS.hlsl";
+		}
+		if (!std::filesystem::exists(shaderPath)) {
+			// Fallback to current directory
+			shaderPath = L"CopyDepthToSharedBufferCS.hlsl";
+		}
+
+		if (!std::filesystem::exists(shaderPath)) {
+			logger::error("[Upscaling] Could not find CopyDepthToSharedBufferCS.hlsl in any expected location!");
+			LOG_FLUSH();
 		}
 
 		copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(shaderPath.c_str(), "cs_5_0");
@@ -390,7 +385,8 @@ void Upscaling::CopyBuffersToSharedResources()
 
 		// 2. Depth
 		{
-			auto& depth = renderer->data.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+			// Use kMAIN_DEPTH instead of kPOST_ZPREPASS_COPY as it's more reliable during transitions
+			auto& depth = renderer->data.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN_DEPTH];
 			if (depth.depthSRV && copyDepthToSharedBufferCS && depthBufferShared && depthBufferShared->uav) {
 				uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
 				uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
@@ -411,9 +407,9 @@ void Upscaling::CopyBuffersToSharedResources()
 		}
 
 		// 3. HUDLess (Backbuffer before UI)
-		auto& swapChain = renderer->data.renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
-		if (swapChain.texture && HUDLessBufferShared && HUDLessBufferShared->resource11) {
-			context->CopyResource(HUDLessBufferShared->resource11, swapChain.texture);
+		auto& framebuffer = renderer->data.renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
+		if (framebuffer.texture && HUDLessBufferShared && HUDLessBufferShared->resource11) {
+			context->CopyResource(HUDLessBufferShared->resource11, framebuffer.texture);
 		}
 
 	} catch (...) {

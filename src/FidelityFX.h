@@ -1,5 +1,7 @@
 #pragma once
 
+#include <d3d11_4.h>
+#include <d3d12.h>
 #include <ffx_api.h>
 #include <ffx_api.hpp>
 #include <ffx_upscale.h>
@@ -11,28 +13,26 @@
 #include <dx12/ffx_api_framegeneration_dx12.h>
 #include <dx12/ffx_api_framegeneration_dx12.hpp>
 
-#include "Buffer.h"
-
-
-class FidelityFX
+class FSR4SkyrimHandler
 {
 public:
-	static FidelityFX* GetSingleton()
+	static FSR4SkyrimHandler* GetSingleton()
 	{
-		static FidelityFX singleton;
+		static FSR4SkyrimHandler singleton;
 		return &singleton;
 	}
 
 	HMODULE module = nullptr;
 
-	ffx::Context swapChainContext{};
-	ffx::Context frameGenContext;
-	ffx::Context upscaleContext;
+	ffxContext swapChainContext = nullptr;
+	ffxContext frameGenContext = nullptr;
+	ffxContext upscaleContext = nullptr;
 
 	bool isAvailable = false;
 	bool upscaleInitialized = false;
 	bool frameGenInitialized = false;
 	bool swapChainContextInitialized = false;
+	bool lastBypass = true;
 
 	void LoadFFX();
 	void SetupFrameGeneration();
