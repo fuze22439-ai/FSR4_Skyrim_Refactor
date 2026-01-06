@@ -70,69 +70,81 @@ void FSR4SkyrimHandler::LoadFFX()
 
 void FSR4SkyrimHandler::SetupFrameGeneration()
 {
-	if (frameGenInitialized || upscaleInitialized)
+	// Only skip if ALL contexts are already initialized
+	if (frameGenInitialized && upscaleInitialized && swapChainContextInitialized) {
+		logger::info("[FSR4SkyrimHandler] SetupFrameGeneration: All contexts already initialized, skipping.");
 		return;
+	}
 
 	auto swapChain = DX12SwapChain::GetSingleton();
 
-	ffx::CreateContextDescFrameGeneration createFg{};
-	createFg.displaySize = { swapChain->swapChainDesc.Width, swapChain->swapChainDesc.Height };
-	createFg.maxRenderSize = createFg.displaySize;
-	createFg.flags = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT | 
-                     FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS |
-                     FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION |
-                     FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE |
-                     FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
-                     FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
-	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(swapChain->swapChainDesc.Format);
-
-    // FSR 4.0 Version Descriptor
-    ffxCreateContextDescFrameGenerationVersion versionDesc{};
-	versionDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
-    versionDesc.version = FFX_FRAMEGENERATION_VERSION;
-
+	// 1. Create Backend
 	ffxCreateBackendDX12Desc backendDesc{};
 	backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
 	backendDesc.device = swapChain->d3d12Device.get();
 
-	// Link headers manually
-	createFg.header.pNext = &versionDesc.header;
-	versionDesc.header.pNext = &backendDesc.header;
-	backendDesc.header.pNext = nullptr;
-
-	logger::info("[FSR4SkyrimHandler] Attempting to create frame generation context...");
-	auto ret = ffxCreateContext(&frameGenContext, &createFg.header, nullptr);
-	if (ret != FFX_API_RETURN_OK) {
-		logger::critical("[FSR4SkyrimHandler] Failed to create frame generation context! Error code: 0x{:X}", (uint32_t)ret);
-	} else {
-		logger::info("[FSR4SkyrimHandler] Successfully created frame generation context.");
-		frameGenInitialized = true;
+	// 2. SwapChain Context is ALREADY created in DX12SwapChain::CreateSwapChain() using ForHwnd
+	// DO NOT attempt to wrap again here - it would fail with Error 0x3
+	// The swapChainContextInitialized flag is already set by DX12SwapChain
+	if (!swapChainContextInitialized) {
+		logger::warn("[FSR4SkyrimHandler] SwapChain context was not initialized by DX12SwapChain! This should not happen.");
 	}
 
-	// Setup Upscale Context for Native AA
-	ffx::CreateContextDescUpscale createUpscale{};
-	createUpscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | 
-                          FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS |
-                          FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION |
-                          FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
-                          FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
-	createUpscale.maxRenderSize = { swapChain->swapChainDesc.Width, swapChain->swapChainDesc.Height };
-	createUpscale.maxUpscaleSize = createUpscale.maxRenderSize;
+	// 3. Setup Frame Generation Context
+	{
+		ffx::CreateContextDescFrameGeneration createFg{};
+		createFg.displaySize = { swapChain->swapChainDesc.Width, swapChain->swapChainDesc.Height };
+		createFg.maxRenderSize = createFg.displaySize;
+		// Following ENBFrameGeneration: Only use ASYNC_WORKLOAD_SUPPORT
+		// Other flags may cause issues with FSR 4.0
+		createFg.flags = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
+		createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(swapChain->swapChainDesc.Format);
 
-	ffxCreateContextDescUpscaleVersion upscaleVersionDesc{};
-	upscaleVersionDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
-	upscaleVersionDesc.version = FFX_UPSCALER_VERSION;
+		// FSR 4.0 Version Descriptor
+		ffxCreateContextDescFrameGenerationVersion versionDesc{};
+		versionDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+		versionDesc.version = FFX_FRAMEGENERATION_VERSION;
 
-	createUpscale.header.pNext = &upscaleVersionDesc.header;
-	upscaleVersionDesc.header.pNext = &backendDesc.header;
+		// Link headers manually
+		createFg.header.pNext = &versionDesc.header;
+		versionDesc.header.pNext = &backendDesc.header;
 
-	logger::info("[FSR4SkyrimHandler] Attempting to create upscale context (Native AA)...");
-	ret = ffxCreateContext(&upscaleContext, &createUpscale.header, nullptr);
-	if (ret != FFX_API_RETURN_OK) {
-		logger::critical("[FSR4SkyrimHandler] Failed to create upscale context! Error code: 0x{:X}", (uint32_t)ret);
-	} else {
-		logger::info("[FSR4SkyrimHandler] Successfully created upscale context.");
-		upscaleInitialized = true;
+		logger::info("[FSR4SkyrimHandler] Attempting to create frame generation context...");
+		auto ret = ffxCreateContext(&frameGenContext, &createFg.header, nullptr);
+		if (ret != FFX_API_RETURN_OK) {
+			logger::critical("[FSR4SkyrimHandler] Failed to create frame generation context! Error code: 0x{:X}", (uint32_t)ret);
+		} else {
+			logger::info("[FSR4SkyrimHandler] Successfully created frame generation context.");
+			frameGenInitialized = true;
+		}
+	}
+
+	// 4. Setup Upscale Context for Native AA
+	{
+		ffx::CreateContextDescUpscale createUpscale{};
+		createUpscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | 
+							  FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS |
+							  FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION |
+							  FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+							  FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+		createUpscale.maxRenderSize = { swapChain->swapChainDesc.Width, swapChain->swapChainDesc.Height };
+		createUpscale.maxUpscaleSize = createUpscale.maxRenderSize;
+
+		ffxCreateContextDescUpscaleVersion upscaleVersionDesc{};
+		upscaleVersionDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+		upscaleVersionDesc.version = FFX_UPSCALER_VERSION;
+
+		createUpscale.header.pNext = &upscaleVersionDesc.header;
+		upscaleVersionDesc.header.pNext = &backendDesc.header;
+
+		logger::info("[FSR4SkyrimHandler] Attempting to create upscale context (Native AA)...");
+		auto ret = ffxCreateContext(&upscaleContext, &createUpscale.header, nullptr);
+		if (ret != FFX_API_RETURN_OK) {
+			logger::critical("[FSR4SkyrimHandler] Failed to create upscale context! Error code: 0x{:X}", (uint32_t)ret);
+		} else {
+			logger::info("[FSR4SkyrimHandler] Successfully created upscale context.");
+			upscaleInitialized = true;
+		}
 	}
 }
 
@@ -151,186 +163,194 @@ float GetVerticalFOVRad()
 
 static ffxReturnCode_t FrameGenerationCallback(ffxDispatchDescFrameGeneration* params, void* pUserCtx)
 {
-	// FSR 4.0: The callback is responsible for the actual interpolation dispatch.
-	if (!pUserCtx) return FFX_API_RETURN_ERROR_PARAMETER;
-
-	ffxContext context = reinterpret_cast<ffxContext>(pUserCtx);
-
-	// FORCE Frame Generation: 1 generated frame means 2x FPS
-	params->numGeneratedFrames = 1;
-	params->backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
-
-	static uint32_t callCount = 0;
-	static auto lastTime = std::chrono::high_resolution_clock::now();
-	
+	// Detailed diagnostic log for frame generation
+	static uint64_t callCount = 0;
 	callCount++;
-
-	auto currentTime = std::chrono::high_resolution_clock::now();
-	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastTime).count();
-
-	if (duration >= 1000) { // Log every second
-		float avgFrameTime = (float)duration / (float)callCount;
-		logger::info("[FSR4_Telemetry] FG Callback Stats: Calls/sec: {}, Avg Interval: {:.2f}ms, Last SchedulerID: {}, Generated: {}", 
-			callCount, avgFrameTime, params->frameID, params->numGeneratedFrames);
-		lastTime = currentTime;
-		callCount = 0;
+	
+	// Log every 60 calls AND first 10 calls
+	bool shouldLog = (callCount % 60 == 0) || (callCount < 10);
+	if (shouldLog) {
+		logger::info("[FG_Callback] call#{}, frameID={}, numGenFrames={}, reset={}",
+			callCount, params->frameID, params->numGeneratedFrames, params->reset);
 	}
-
-	// The presentColor passed here is the backbuffer containing UI.
-	// The HUDLessColor was already provided in ffx::Configure.
-	auto ret = ffxDispatch(&context, &params->header);
-	if (ret != FFX_API_RETURN_OK) {
-		static uint32_t lastErr = 0;
-		if ((uint32_t)ret != lastErr) {
-			logger::error("[FSR4SkyrimHandler] FrameGenerationCallback: ffxDispatch failed! Error: 0x{:X}, frameID: {}", (uint32_t)ret, params->frameID);
-			lastErr = (uint32_t)ret;
-		}
+	
+	// Check if callback context is valid
+	if (!pUserCtx) {
+		logger::error("[FG_Callback] pUserCtx is NULL!");
+		return FFX_API_RETURN_ERROR;
 	}
-	return ret;
+	
+	// FSR 4.0: Match ENBFrameGeneration's minimal callback - let FSR handle pacing internally
+	// DO NOT modify params->numGeneratedFrames - it breaks FSR's frame pacing!
+	auto result = ffxDispatch(reinterpret_cast<ffxContext*>(pUserCtx), &params->header);
+	if (result != FFX_API_RETURN_OK && callCount % 100 == 0) {
+		logger::error("[FG_Callback] ffxDispatch failed! Error: 0x{:X}", (uint32_t)result);
+	}
+	return result;
 }
 
 void FSR4SkyrimHandler::Present(bool a_useFrameGeneration, bool a_bypass)
 {
+	(void)a_bypass; // Unused - kept for API compatibility
+
 	if (!swapChainContextInitialized)
 		return;
+
+	// Following ENBFrameGeneration: No bypass logic, FSR always runs
+	uint64_t frameID = currentFSRFrameID;
 
 	auto upscaling = Upscaling::GetSingleton();
 	auto swapChain = DX12SwapChain::GetSingleton();
 	auto commandList = swapChain->commandLists[swapChain->frameIndex].get();
 
-	auto state = RE::BSGraphics::State::GetSingleton();
-	auto stateEx = reinterpret_cast<StateEx*>(state);
+	bool shouldLog = (frameID < 200) || (frameID % 100 == 0);
 
-	// FSR 4.0: Use a dedicated, strictly incrementing frame ID for the scheduler.
-	static uint64_t internalFrameID = 0;
-	uint64_t frameID = internalFrameID++;
-
-	// Calculate manual deltaTime for better stability
-	static LARGE_INTEGER lastPresentTime = { 0 };
-	LARGE_INTEGER currentTime;
-	QueryPerformanceCounter(&currentTime);
-
-	float manualDeltaTime = 16.6f; // Default to 60fps
-	if (lastPresentTime.QuadPart != 0 && swapChain->qpf.QuadPart > 0) {
-		manualDeltaTime = (float)(currentTime.QuadPart - lastPresentTime.QuadPart) * 1000.0f / (float)swapChain->qpf.QuadPart;
-	} else if (swapChain->qpf.QuadPart == 0) {
-		// Fallback if QPF is not initialized
-		QueryPerformanceFrequency(&swapChain->qpf);
+	// DIAGNOSTIC: Log every frame for first 20 frames to verify frameID increments by 1
+	static uint64_t lastLoggedFrameID = 0;
+	if (frameID < 20 || (frameID - lastLoggedFrameID != 1 && lastLoggedFrameID != 0)) {
+		logger::info("[FidelityFX] frameID={}, lastFrameID={}, diff={}", frameID, lastLoggedFrameID, frameID - lastLoggedFrameID);
 	}
-	lastPresentTime = currentTime;
+	lastLoggedFrameID = frameID;
 
-	// Clamp deltaTime to reasonable values (60fps = 16.6ms, 30fps = 33.3ms)
-	if (manualDeltaTime < 1.0f) manualDeltaTime = 1.0f;
-	if (manualDeltaTime > 100.0f) manualDeltaTime = 100.0f; // Clamp to 10fps min to accommodate heavy areas like Whiterun exterior
+	// Get StateEx for reading projectionPosScaleX/Y (jitter)
+	auto state = RE::BSGraphics::State::GetSingleton();
+	auto stateEx = state ? reinterpret_cast<StateEx*>(state) : nullptr;
+
+	// Use game's deltaTime like ENBFrameGeneration for consistency
+	static auto s_deltaTime = (float*)REL::RelocationID(523660, 410199).address();
+	float manualDeltaTime = s_deltaTime ? (*s_deltaTime * 1000.0f) : 16.6f;
+	
+	// ENBFrameGeneration does NOT clamp deltaTime - follow the same approach
+	// Invalid deltaTime (<=0 or extremely large) indicates game pause/loading
+	// In these states, FG should still run but FSR will handle it gracefully
+	// Only apply minimal sanity check to prevent division by zero issues
+	if (manualDeltaTime <= 0.0f) manualDeltaTime = 16.6f; // Default to 60fps if invalid
 
 	auto HUDLessColor = (upscaling->HUDLessBufferShared) ? upscaling->HUDLessBufferShared->resource.get() : nullptr;
 	auto depth = (upscaling->depthBufferShared) ? upscaling->depthBufferShared->resource.get() : nullptr;
 	auto motionVectors = (upscaling->motionVectorBufferShared) ? upscaling->motionVectorBufferShared->resource.get() : nullptr;
 	auto upscaledColor = (upscaling->upscaledBufferShared) ? upscaling->upscaledBufferShared->resource.get() : nullptr;
 
-	bool shouldLog = (frameID % 100 == 0);
 	bool resourcesReady = HUDLessColor && depth && motionVectors && upscaledColor;
 
 	if (!commandList) {
+		currentFSRFrameID++;
 		return;
 	}
 
+	// Track resource state changes (only log when state changes to reduce spam)
+	static bool lastResourcesReady = false;
+	if (resourcesReady != lastResourcesReady) {
+		logger::info("[FSR4SkyrimHandler] Resource state changed: {} -> {} at frame {}", 
+			lastResourcesReady, resourcesReady, frameID);
+		LOG_FLUSH();
+		lastResourcesReady = resourcesReady;
+	}
+
 	if (shouldLog) {
-		logger::info("[FSR4SkyrimHandler] Present Dispatch Start. frameID: {}, useFG: {}, bypass: {}, resourcesReady: {}, deltaTime: {:.2f}ms", 
-			frameID, a_useFrameGeneration, a_bypass, resourcesReady, manualDeltaTime);
+		logger::info("[FSR4SkyrimHandler] Present Dispatch Start. frameID: {}, useFG: {}, resourcesReady: {}, deltaTime: {:.2f}ms", 
+			frameID, a_useFrameGeneration, resourcesReady, manualDeltaTime);
+		LOG_FLUSH();
 	}
 
-	// 1. Configure Frame Pacing & Scheduler (SwapChain Context)
+	// 1. Configure Pacing
 	if (swapChainContextInitialized) {
-		if (shouldLog) logger::info("[FSR4SkyrimHandler] Configuring SwapChain Context...");
-		// FSR 4.0: Temporarily disable KeyValue configuration to isolate crash
-		/*
-		FfxApiSwapchainFramePacingTuning framePacingTuning{ 0.1f, 0.1f, true, 2, false }; 
-		ffxConfigureDescFrameGenerationSwapChainKeyValueDX12 framePacingTuningParameters{};
-		memset(&framePacingTuningParameters, 0, sizeof(framePacingTuningParameters));
-		framePacingTuningParameters.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_DX12;
-		framePacingTuningParameters.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
-		framePacingTuningParameters.ptr = &framePacingTuning;
-
-		auto ret = ffxConfigure(&swapChainContext, &framePacingTuningParameters.header);
-		if (shouldLog) logger::info("[FSR4SkyrimHandler] SwapChain Context Configured. Result: 0x{:X}", (uint32_t)ret);
-		*/
+		// varianceFactor: 0.1 (default) is tight, 0.3-0.5 is more forgiving for unstable frame times
+		// Skyrim with mods has highly variable frame times (22-52ms observed), so use higher variance
+		FfxApiSwapchainFramePacingTuning framePacingTuning{ 0.1f, 0.3f, true, 2, false };
+		ffxConfigureDescFrameGenerationSwapChainKeyValueDX12 tuning{};
+		tuning.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_DX12;
+		tuning.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
+		tuning.ptr = &framePacingTuning;
+		ffxConfigure(&swapChainContext, &tuning.header);
 	}
 
-	// 2. Configure Frame Generation Context
-	{
-		if (shouldLog) logger::info("[FSR4SkyrimHandler] Configuring FrameGen Context... (Initialized: {}, bypass: {}, resourcesReady: {})", frameGenInitialized, a_bypass, resourcesReady);
-		if (frameGenInitialized) {
-			ffxConfigureDescFrameGeneration configParameters{};
-			memset(&configParameters, 0, sizeof(configParameters)); // Zero out to prevent SDK from reading stack garbage
-			configParameters.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-			configParameters.swapChain = swapChainContext;
-			
-			// FSR 4.0: Only enable frame generation if NOT in bypass AND resources are ready
-			configParameters.frameGenerationEnabled = a_useFrameGeneration && !a_bypass && resourcesReady;
-			
+	// 2. Configure Frame Generation (MANDATORY EVERY FRAME)
+	// Following ENBFrameGeneration: Enable FG based on user setting, NOT resource availability!
+	// FSR will use backbuffer if HUDLessColor is not provided.
+	if (frameGenInitialized) {
+		ffxConfigureDescFrameGeneration configParameters{};
+		memset(&configParameters, 0, sizeof(configParameters));
+		configParameters.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+		configParameters.swapChain = swapChain->swapChain;
+		
+		// Following ENBFrameGeneration: Only check user setting, NOT resourcesReady!
+		if (a_useFrameGeneration) {
+			configParameters.frameGenerationEnabled = true;
 			configParameters.frameGenerationCallback = FrameGenerationCallback;
-			configParameters.frameGenerationCallbackUserContext = frameGenContext;
+			configParameters.frameGenerationCallbackUserContext = &frameGenContext;
 			
-			bool useAA = upscaleInitialized && (upscaling->settings.sharpness > 0.0f);
+			// Provide HUDLessColor if available, otherwise FSR uses backbuffer
 			if (resourcesReady) {
+				bool useAA = upscaleInitialized && (upscaling->settings.sharpness > 0.0f);
 				configParameters.HUDLessColor = ffxApiGetResourceDX12(useAA ? upscaledColor : HUDLessColor);
 			} else {
-				configParameters.HUDLessColor.resource = nullptr;
-				configParameters.HUDLessColor.state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
-			}
-			
-			configParameters.frameID = frameID;
-			configParameters.onlyPresentGenerated = false;
-			configParameters.allowAsyncWorkloads = upscaling->settings.allowAsyncWorkloads != 0; 
-			configParameters.flags = FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES;
-			configParameters.generationRect.width = swapChain->swapChainDesc.Width;
-			configParameters.generationRect.height = swapChain->swapChainDesc.Height;
-			
-			if (shouldLog) {
-				logger::info("[FSR4SkyrimHandler] Debugging configParameters before ffxConfigure:");
-				logger::info("  - type: {}", (uint32_t)configParameters.header.type);
-				logger::info("  - swapChain: {}", (void*)configParameters.swapChain);
-				logger::info("  - enabled: {}", configParameters.frameGenerationEnabled);
-				logger::info("  - callback: {}", (void*)configParameters.frameGenerationCallback);
-				logger::info("  - userCtx: {}", (void*)configParameters.frameGenerationCallbackUserContext);
-				logger::info("  - HUDLessColor.resource: {}", (void*)configParameters.HUDLessColor.resource);
-				logger::info("  - frameID: {}", configParameters.frameID);
-				logger::info("  - flags: 0x{:X}", configParameters.flags);
-				logger::info("  - rect: {}x{}", configParameters.generationRect.width, configParameters.generationRect.height);
-				LOG_FLUSH();
-			}
-			
-			if (shouldLog) logger::info("[FSR4SkyrimHandler] Calling ffxConfigure for FrameGen...");
-			
-			// FSR 4.0: Only call configure if resources are ready OR if we are explicitly enabling/disabling
-			// It seems calling it with HUDLessColor.resource = 0x0 causes a crash in some SDK versions
-			if (resourcesReady) {
-				auto ret = ffxConfigure(&frameGenContext, &configParameters.header);
-				if (shouldLog) logger::info("[FSR4SkyrimHandler] FrameGen Context Configured. Result: 0x{:X}", (uint32_t)ret);
-			} else {
-				if (shouldLog) logger::info("[FSR4SkyrimHandler] Skipping ffxConfigure (Resources not ready).");
+				configParameters.HUDLessColor = FfxApiResource{};
 			}
 		} else {
-			if (shouldLog) logger::warn("[FSR4SkyrimHandler] Skipping FrameGen configure (Not Initialized).");
+			// User disabled FG
+			configParameters.frameGenerationEnabled = false;
+			configParameters.frameGenerationCallbackUserContext = nullptr;
+			configParameters.frameGenerationCallback = nullptr;
+			configParameters.HUDLessColor = FfxApiResource{};
+		}
+		
+		configParameters.frameID = frameID;
+		// CRITICAL: Following ENBFrameGeneration - must set onlyPresentGenerated = false
+		// This tells FSR to present BOTH original and generated frames
+		// Without this, FSR may only present generated frames or skip frames entirely
+		configParameters.onlyPresentGenerated = false;
+		// CRITICAL: Match ENBFrameGeneration - always true for best pacing
+		configParameters.allowAsyncWorkloads = true;
+		// Match ENBFrameGeneration: flags = 0 for production (no debug pacing lines)
+		configParameters.flags = 0;
+		configParameters.generationRect.left = 0;
+		configParameters.generationRect.top = 0;
+		configParameters.generationRect.width = swapChain->swapChainDesc.Width;
+		configParameters.generationRect.height = swapChain->swapChainDesc.Height;
+		
+		auto configResult = ffxConfigure(&frameGenContext, &configParameters.header);
+		if (configResult != FFX_API_RETURN_OK) {
+			logger::error("[FidelityFX] Failed to configure frame generation! Error: 0x{:X}", (uint32_t)configResult);
+		}
+		
+		// DIAGNOSTIC: Log Configure details every 300 frames
+		static uint64_t lastConfigLogFrame = 0;
+		if (frameID - lastConfigLogFrame >= 300) {
+			lastConfigLogFrame = frameID;
+			logger::info("[FidelityFX] Configure: swapChain={:p}, enabled={}, callback={:p}, onlyPresentGen={}, flags={}",
+				(void*)configParameters.swapChain,
+				configParameters.frameGenerationEnabled,
+				(void*)configParameters.frameGenerationCallback,
+				configParameters.onlyPresentGenerated,
+				configParameters.flags);
 		}
 	}
 
-	if (a_useFrameGeneration && frameGenInitialized && !a_bypass && resourcesReady) {
-		// Safety check for camera pointers
-		static uintptr_t bsGraphicsStateAddr = REL::RelocationID(517032, 403540).address();
-		float cameraNearVal = 0.1f;
-		float cameraFarVal = 100000.0f;
-		if (bsGraphicsStateAddr != 0) {
-			cameraNearVal = *(float*)(bsGraphicsStateAddr + 0x40);
-			cameraFarVal = *(float*)(bsGraphicsStateAddr + 0x44);
-		}
+	// Following ENBFrameGeneration: Dispatch PrepareV2 when user enables FG, regardless of resource availability
+	// FSR handles null resources gracefully
+	if (a_useFrameGeneration && frameGenInitialized) {
+		// Use static memory addresses like ENBFrameGeneration for stability during loading
+		static auto s_cameraNear = (float*)(REL::RelocationID(517032, 403540).address() + 0x40);
+		static auto s_cameraFar = (float*)(REL::RelocationID(517032, 403540).address() + 0x44);
+		float cameraNearVal = s_cameraNear ? *s_cameraNear : 0.1f;
+		float cameraFarVal = s_cameraFar ? *s_cameraFar : 100000.0f;
+		
+		// Safety clamp
+		if (cameraNearVal <= 0.0f) cameraNearVal = 0.1f;
+		if (cameraFarVal <= cameraNearVal) cameraFarVal = 100000.0f;
 
-		if (shouldLog) logger::info("[FSR4SkyrimHandler] Dispatching Prepare & AA...");
-		// Dispatch FSR AA (Native AA)
-		bool useAA = upscaleInitialized && (upscaling->settings.sharpness > 0.0f);
+		// Dispatch AA only when resources are actually ready
+		bool useAA = upscaleInitialized && resourcesReady && (upscaling->settings.sharpness > 0.0f);
+		
+		// DIAGNOSTIC: Log AA dispatch decision every 300 frames
+		static uint64_t aaLogCounter = 0;
+		if (aaLogCounter++ % 300 == 0) {
+			logger::info("[FidelityFX] AA Check: upscaleInit={}, resourcesReady={}, sharpness={:.2f}, useAA={}",
+				upscaleInitialized, resourcesReady, upscaling->settings.sharpness, useAA);
+		}
+		
 		if (useAA) {
-			if (shouldLog) logger::info("[FSR4SkyrimHandler] Dispatching Upscale (AA)...");
 			ffxDispatchDescUpscale upscaleDispatch{};
 			memset(&upscaleDispatch, 0, sizeof(upscaleDispatch));
 			upscaleDispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -340,119 +360,139 @@ void FSR4SkyrimHandler::Present(bool a_useFrameGeneration, bool a_bypass)
 			upscaleDispatch.motionVectors = ffxApiGetResourceDX12(motionVectors);
 			upscaleDispatch.output = ffxApiGetResourceDX12(upscaledColor, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
 
+			// Read jitter from projectionPosScaleX/Y like ENBFrameGeneration does
 			if (stateEx) {
 				upscaleDispatch.jitterOffset.x = stateEx->projectionPosScaleX * (float)swapChain->swapChainDesc.Width / 2.0f;
 				upscaleDispatch.jitterOffset.y = stateEx->projectionPosScaleY * (float)swapChain->swapChainDesc.Height / 2.0f;
+			} else {
+				upscaleDispatch.jitterOffset.x = 0.0f;
+				upscaleDispatch.jitterOffset.y = 0.0f;
 			}
-
 			upscaleDispatch.motionVectorScale.x = (float)swapChain->swapChainDesc.Width;
 			upscaleDispatch.motionVectorScale.y = (float)swapChain->swapChainDesc.Height;
 			upscaleDispatch.renderSize.width = swapChain->swapChainDesc.Width;
 			upscaleDispatch.renderSize.height = swapChain->swapChainDesc.Height;
 			upscaleDispatch.upscaleSize = upscaleDispatch.renderSize;
-
 			upscaleDispatch.frameTimeDelta = manualDeltaTime;
-
 			upscaleDispatch.cameraNear = cameraNearVal;
 			upscaleDispatch.cameraFar = cameraFarVal;
 			upscaleDispatch.cameraFovAngleVertical = GetVerticalFOVRad();
 			upscaleDispatch.viewSpaceToMetersFactor = 0.01428222656f;
 			upscaleDispatch.preExposure = 1.0f;
-			upscaleDispatch.reset = (frameID < 5);
+			upscaleDispatch.reset = (frameID < 10);
 			upscaleDispatch.enableSharpening = true;
 			upscaleDispatch.sharpness = upscaling->settings.sharpness;
 			upscaleDispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
 
-			auto ret = ffxDispatch(&upscaleContext, &upscaleDispatch.header);
-			if (shouldLog) logger::info("[FSR4SkyrimHandler] Upscale Dispatch Result: 0x{:X}", (uint32_t)ret);
+			ffxDispatch(&upscaleContext, &upscaleDispatch.header);
 
-			// Transition upscaledColor to NON_PIXEL_SHADER_RESOURCE for FrameGen
-			D3D12_RESOURCE_BARRIER barrier = {};
-			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-			barrier.Transition.pResource = upscaledColor;
-			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(upscaledColor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			commandList->ResourceBarrier(1, &barrier);
-		} else {
-			// Even if AA is off, transition upscaledColor to SRV to match the back transition in DX12SwapChain
-			D3D12_RESOURCE_BARRIER barrier = {};
-			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-			barrier.Transition.pResource = upscaledColor;
-			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		} else if (upscaledColor) {
+			D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(upscaledColor, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			commandList->ResourceBarrier(1, &barrier);
 		}
 
-		if (shouldLog) logger::info("[FSR4SkyrimHandler] Dispatching FrameGen Prepare...");
-		ffxDispatchDescFrameGenerationPrepareV2 dispatchParameters{};
-		memset(&dispatchParameters, 0, sizeof(dispatchParameters));
-		dispatchParameters.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
-		dispatchParameters.commandList = commandList;
-		dispatchParameters.renderSize.width = swapChain->swapChainDesc.Width;
-		dispatchParameters.renderSize.height = swapChain->swapChainDesc.Height;
-
+		// Dispatch PrepareV2
+		ffxDispatchDescFrameGenerationPrepareV2 prepare{};
+		memset(&prepare, 0, sizeof(prepare));
+		prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+		prepare.commandList = commandList;
+		prepare.renderSize.width = swapChain->swapChainDesc.Width;
+		prepare.renderSize.height = swapChain->swapChainDesc.Height;
+		// Read jitter from projectionPosScaleX/Y like ENBFrameGeneration does
+		// This is the value that was written by UpdateJitter at frame start
 		if (stateEx) {
-			dispatchParameters.jitterOffset.x = stateEx->projectionPosScaleX * (float)swapChain->swapChainDesc.Width / 2.0f;
-			dispatchParameters.jitterOffset.y = stateEx->projectionPosScaleY * (float)swapChain->swapChainDesc.Height / 2.0f;
+			prepare.jitterOffset.x = stateEx->projectionPosScaleX * (float)swapChain->swapChainDesc.Width / 2.0f;
+			prepare.jitterOffset.y = stateEx->projectionPosScaleY * (float)swapChain->swapChainDesc.Height / 2.0f;
+		} else {
+			prepare.jitterOffset.x = 0.0f;
+			prepare.jitterOffset.y = 0.0f;
 		}
-
-		dispatchParameters.frameTimeDelta = manualDeltaTime;
-		dispatchParameters.frameID = frameID;
-		dispatchParameters.flags = FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES;
-		dispatchParameters.depth = ffxApiGetResourceDX12(depth);
-		dispatchParameters.motionVectors = ffxApiGetResourceDX12(motionVectors);
-
-		dispatchParameters.motionVectorScale.x = (float)swapChain->swapChainDesc.Width;
-		dispatchParameters.motionVectorScale.y = (float)swapChain->swapChainDesc.Height;
-
-		dispatchParameters.cameraNear = cameraNearVal;
-		dispatchParameters.cameraFar = cameraFarVal;
-		dispatchParameters.cameraFovAngleVertical = GetVerticalFOVRad();
-		dispatchParameters.viewSpaceToMetersFactor = 0.01428222656f;
+		prepare.frameTimeDelta = manualDeltaTime;
+		prepare.frameID = frameID;
+		// Match ENBFrameGeneration: flags = 0 for production
+		prepare.flags = 0;
+		prepare.depth = ffxApiGetResourceDX12(depth);
+		prepare.motionVectors = ffxApiGetResourceDX12(motionVectors);
+		prepare.motionVectorScale.x = (float)swapChain->swapChainDesc.Width;
+		prepare.motionVectorScale.y = (float)swapChain->swapChainDesc.Height;
+		prepare.cameraNear = cameraNearVal;
+		prepare.cameraFar = cameraFarVal;
+		prepare.cameraFovAngleVertical = GetVerticalFOVRad();
+		prepare.viewSpaceToMetersFactor = 0.01428222656f;
 		
-		dispatchParameters.reset = (frameID < 5) || lastBypass;
-
-		// Fill in camera info from Skyrim's PlayerCamera
-		try {
-			auto camera = RE::PlayerCamera::GetSingleton();
-			if (camera && camera->cameraRoot) {
-				auto& world = camera->cameraRoot->world;
-				dispatchParameters.cameraPosition[0] = world.translate.x;
-				dispatchParameters.cameraPosition[1] = world.translate.y;
-				dispatchParameters.cameraPosition[2] = world.translate.z;
-
-				dispatchParameters.cameraRight[0] = world.rotate.entry[0][0];
-				dispatchParameters.cameraRight[1] = world.rotate.entry[1][0];
-				dispatchParameters.cameraRight[2] = world.rotate.entry[2][0];
-
-				dispatchParameters.cameraForward[0] = world.rotate.entry[0][1];
-				dispatchParameters.cameraForward[1] = world.rotate.entry[1][1];
-				dispatchParameters.cameraForward[2] = world.rotate.entry[2][1];
-
-				dispatchParameters.cameraUp[0] = world.rotate.entry[0][2];
-				dispatchParameters.cameraUp[1] = world.rotate.entry[1][2];
-				dispatchParameters.cameraUp[2] = world.rotate.entry[2][2];
-			} else {
-				dispatchParameters.cameraPosition[0] = 0.0f; dispatchParameters.cameraPosition[1] = 0.0f; dispatchParameters.cameraPosition[2] = 0.0f;
-				dispatchParameters.cameraForward[0] = 0.0f; dispatchParameters.cameraForward[1] = 1.0f; dispatchParameters.cameraForward[2] = 0.0f;
-				dispatchParameters.cameraUp[0] = 0.0f; dispatchParameters.cameraUp[1] = 0.0f; dispatchParameters.cameraUp[2] = 1.0f;
-				dispatchParameters.cameraRight[0] = 1.0f; dispatchParameters.cameraRight[1] = 0.0f; dispatchParameters.cameraRight[2] = 0.0f;
-			}
-		} catch (...) {
-			dispatchParameters.cameraPosition[0] = 0.0f; dispatchParameters.cameraPosition[1] = 0.0f; dispatchParameters.cameraPosition[2] = 0.0f;
-			dispatchParameters.cameraForward[0] = 0.0f; dispatchParameters.cameraForward[1] = 1.0f; dispatchParameters.cameraForward[2] = 0.0f;
-			dispatchParameters.cameraUp[0] = 0.0f; dispatchParameters.cameraUp[1] = 0.0f; dispatchParameters.cameraUp[2] = 1.0f;
-			dispatchParameters.cameraRight[0] = 1.0f; dispatchParameters.cameraRight[1] = 0.0f; dispatchParameters.cameraRight[2] = 0.0f;
+		// Reset flag: true on first few frames OR when RequestReset() was called (scene transitions)
+		prepare.reset = needsReset || (frameID < 5);
+		if (needsReset) {
+			logger::info("[FSR4SkyrimHandler] Reset triggered at frame {}", frameID);
+			needsReset = false;  // Clear after use
 		}
 
-		auto ret = ffxDispatch(&frameGenContext, &dispatchParameters.header);
-		if (shouldLog) logger::info("[FSR4SkyrimHandler] FrameGen Prepare Result: 0x{:X}", (uint32_t)ret);
-		if (shouldLog) logger::info("[FSR4SkyrimHandler] Dispatch Complete.");
+		// FSR 4.0 requires camera vectors - provide safe defaults if camera unavailable
+		// Default: Identity orientation looking forward (+Y in Skyrim), positioned at origin
+		prepare.cameraPosition[0] = 0.0f; prepare.cameraPosition[1] = 0.0f; prepare.cameraPosition[2] = 0.0f;
+		prepare.cameraRight[0] = 1.0f; prepare.cameraRight[1] = 0.0f; prepare.cameraRight[2] = 0.0f;
+		prepare.cameraForward[0] = 0.0f; prepare.cameraForward[1] = 1.0f; prepare.cameraForward[2] = 0.0f;
+		prepare.cameraUp[0] = 0.0f; prepare.cameraUp[1] = 0.0f; prepare.cameraUp[2] = 1.0f;
+
+		// Try to get actual camera data if available
+		// Using multiple null checks to avoid accessing invalid memory during loading
+		// Also detect large camera jumps to auto-trigger reset (fast travel, load game, etc.)
+		static float lastCameraPos[3] = {0.0f, 0.0f, 0.0f};
+		auto camera = RE::PlayerCamera::GetSingleton();
+		if (camera) {
+			auto cameraRoot = camera->cameraRoot.get();
+			if (cameraRoot) {
+				auto& world = cameraRoot->world;
+				prepare.cameraPosition[0] = world.translate.x;
+				prepare.cameraPosition[1] = world.translate.y;
+				prepare.cameraPosition[2] = world.translate.z;
+				prepare.cameraRight[0] = world.rotate.entry[0][0]; prepare.cameraRight[1] = world.rotate.entry[1][0]; prepare.cameraRight[2] = world.rotate.entry[2][0];
+				prepare.cameraForward[0] = world.rotate.entry[0][1]; prepare.cameraForward[1] = world.rotate.entry[1][1]; prepare.cameraForward[2] = world.rotate.entry[2][1];
+				prepare.cameraUp[0] = world.rotate.entry[0][2]; prepare.cameraUp[1] = world.rotate.entry[1][2]; prepare.cameraUp[2] = world.rotate.entry[2][2];
+				
+				// Auto-detect large camera jumps (>1000 units = ~14 meters) as scene transitions
+				float dx = prepare.cameraPosition[0] - lastCameraPos[0];
+				float dy = prepare.cameraPosition[1] - lastCameraPos[1];
+				float dz = prepare.cameraPosition[2] - lastCameraPos[2];
+				float distSq = dx*dx + dy*dy + dz*dz;
+				if (distSq > 1000000.0f) { // 1000^2 = 1000000
+					prepare.reset = true;
+					logger::info("[FSR4SkyrimHandler] Camera jump detected (dist^2={:.0f}), reset triggered", distSq);
+				}
+				lastCameraPos[0] = prepare.cameraPosition[0];
+				lastCameraPos[1] = prepare.cameraPosition[1];
+				lastCameraPos[2] = prepare.cameraPosition[2];
+			}
+		}
+
+		// DIAGNOSTIC: Log Prepare details every 300 frames
+		static uint64_t lastPrepareLogFrame = 0;
+		if (frameID - lastPrepareLogFrame >= 300) {
+			lastPrepareLogFrame = frameID;
+			// Also log raw projectionPosScale to verify offset correctness
+			if (stateEx) {
+				logger::info("[FidelityFX] projectionPosScale: X={:.6f}, Y={:.6f}", 
+					stateEx->projectionPosScaleX, stateEx->projectionPosScaleY);
+			}
+			logger::info("[FidelityFX] PrepareV2: depth={:p}, motionVectors={:p}, mvScale=({:.1f},{:.1f}), jitter=({:.4f},{:.4f})",
+				(void*)prepare.depth.resource,
+				(void*)prepare.motionVectors.resource,
+				prepare.motionVectorScale.x, prepare.motionVectorScale.y,
+				prepare.jitterOffset.x, prepare.jitterOffset.y);
+			logger::info("[FidelityFX] PrepareV2: deltaTime={:.2f}ms, near={:.2f}, far={:.0f}, fov={:.4f}rad",
+				prepare.frameTimeDelta, prepare.cameraNear, prepare.cameraFar, prepare.cameraFovAngleVertical);
+			logger::info("[FidelityFX] PrepareV2: cameraPos=({:.1f},{:.1f},{:.1f}), reset={}",
+				prepare.cameraPosition[0], prepare.cameraPosition[1], prepare.cameraPosition[2], prepare.reset);
+		}
+
+		auto dispatchResult = ffxDispatch(&frameGenContext, &prepare.header);
+		if (dispatchResult != FFX_API_RETURN_OK) {
+			logger::error("[FidelityFX] PrepareV2 Dispatch failed! Error: 0x{:X}", (uint32_t)dispatchResult);
+		}
+		if (shouldLog) logger::info("[FSR4_Skyrim] Dispatch Complete. ID: {}", frameID);
 	}
 
-	lastBypass = a_bypass;
+	currentFSRFrameID++; // Increment for next frame
 }

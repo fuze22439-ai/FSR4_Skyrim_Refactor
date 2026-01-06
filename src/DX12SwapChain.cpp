@@ -48,6 +48,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory4* a_dxgiFactory, DXGI_SWAP_CHAI
 	swapChainDesc.SampleDesc.Count = 1;
 	swapChainDesc.SampleDesc.Quality = 0;
 	swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	// FSR 4.0 SDK internally requires BufferCount = 3 (see FrameInterpolationSwapchainDX12.cpp:1159)
 	swapChainDesc.BufferCount = 3;
 	swapChainDesc.Scaling = DXGI_SCALING_STRETCH;
 	swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; // Force high-performance flip model
@@ -96,6 +97,21 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory4* a_dxgiFactory, DXGI_SWAP_CHAI
 	if (swapChain) {
 		logger::info("[DX12SwapChain] SwapChain created successfully at {:p}", (void*)swapChain);
 		
+		// DIAGNOSTIC: Verify SwapChain is FSR Proxy
+		// SDK uses this IID to detect if SwapChain is an FSR interpolation proxy
+		static const GUID IID_IFfxFrameInterpolationSwapChain = { 0xbeed74b2, 0x282e, 0x4aa3, {0xbb, 0xf7, 0x53, 0x45, 0x60, 0x50, 0x7a, 0x45} };
+		void* testPtr = nullptr;
+		HRESULT qiResult = swapChain->QueryInterface(IID_IFfxFrameInterpolationSwapChain, &testPtr);
+		if (SUCCEEDED(qiResult)) {
+			logger::info("[DX12SwapChain] GOOD: SwapChain IS an FSR Frame Interpolation Proxy!");
+			if (testPtr) {
+				((IUnknown*)testPtr)->Release();
+			}
+		} else {
+			logger::error("[DX12SwapChain] BAD: SwapChain is NOT an FSR Proxy! QueryInterface failed: 0x{:X}", (uint32_t)qiResult);
+			logger::error("[DX12SwapChain] This means Configure will NOT enable interpolation on the SwapChain!");
+		}
+		
 		DXGI_SWAP_CHAIN_DESC1 actualDesc;
 		swapChain->GetDesc1(&actualDesc);
 		UINT bufferCount = actualDesc.BufferCount;
@@ -126,16 +142,20 @@ void DX12SwapChain::CreateInterop()
 	}
 
 	try {
-		HANDLE sharedFenceHandle;
-		DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&d3d12Fence)));
-		DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
+		if (!d3d12Fence) {
+			HANDLE sharedFenceHandle;
+			DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&d3d12Fence)));
+			DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
 		
-		HRESULT hr = d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence));
-		CloseHandle(sharedFenceHandle);
+			HRESULT hr = d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence));
+			CloseHandle(sharedFenceHandle);
 		
-		if (FAILED(hr)) {
-			logger::error("[DX12SwapChain] CreateInterop: Failed to OpenSharedFence! HRESULT: 0x{:X}", (uint32_t)hr);
-			return;
+			if (FAILED(hr)) {
+				logger::error("[DX12SwapChain] CreateInterop: Failed to OpenSharedFence! HRESULT: 0x{:X}", (uint32_t)hr);
+				return;
+			}
+			fenceValue = 1; // Start from 1 for safety
+			for (int i = 0; i < 3; i++) frameFenceValues[i] = 0;
 		}
 
 		D3D11_TEXTURE2D_DESC texDesc11{};
@@ -206,221 +226,93 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
-	// Frame Generation handles its own pacing, force SyncInterval to 0
+	// Following ENBFrameGeneration: Force SyncInterval to 0
 	SyncInterval = 0;
-
-	// Reduced wait frames for faster testing
-	uint64_t waitFrames = g_ENB ? 120 : 60;
+	
+	// Following ENBFrameGeneration: Handle ALLOW_TEARING flag based on fullscreen state
+	BOOL fullscreen = FALSE;
+	swapChain->GetFullscreenState(&fullscreen, nullptr);
+	if (fullscreen || SyncInterval) {
+		Flags &= ~DXGI_PRESENT_ALLOW_TEARING;
+	} else if (SyncInterval == 0) {
+		Flags |= DXGI_PRESENT_ALLOW_TEARING;
+	}
 
 	auto upscaling_ptr = Upscaling::GetSingleton();
-	bool shouldLog = (frameCounter % 100 == 0); // Log every 100 frames
+	bool shouldLog = (frameCounter < 200) || (frameCounter % 100 == 0);
+	
 	if (shouldLog) {
-		logger::info("[DX12SwapChain] Present Start. Frame: {}, frameIndex: {}, fenceValue: {}, setupBuffers: {}", 
-			frameCounter, frameIndex, fenceValue, upscaling_ptr->setupBuffers);
+		logger::info("[DX12SwapChain] Present Frame: {}, frameIndex: {}, setupBuffers: {}", 
+			frameCounter, frameIndex, upscaling_ptr->setupBuffers);
+		LOG_FLUSH();
 	}
 	frameCounter++;
 
-	try {
-		BOOL fullscreen = FALSE;
-		swapChain->GetFullscreenState(&fullscreen, nullptr);
-		if (fullscreen || SyncInterval) {
-			Flags &= ~DXGI_PRESENT_ALLOW_TEARING;
-		} else if (SyncInterval == 0) {
-			Flags |= DXGI_PRESENT_ALLOW_TEARING;
-		}
-
-		// Stability Check: Wait for ENB compilation and resource initialization
-		bool enbIsCompiling = false;
-		if (g_ENB) {
-			if (!enbReady || g_ENB->GetRenderInfo() == nullptr) {
-				enbIsCompiling = true;
-			}
-		}
-
-		// FSR 4.0: We need to be very careful about when we stop bypassing.
-		// If we stop bypassing too early (while the game is still loading or transitioning),
-		// the camera/depth resources might be in an inconsistent state.
-		auto playerCamera = RE::PlayerCamera::GetSingleton();
-		bool cameraReady = playerCamera && playerCamera->cameraRoot;
-		bool bypass = enbIsCompiling || frameCounter < waitFrames || !upscaling_ptr->setupBuffers || !cameraReady;
-
-		// Wait for D3D11 to finish
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Step 1: CopyBuffersToSharedResources");
-		}
-		upscaling_ptr->CopyBuffersToSharedResources();
-
-		if (!d3d11Fence || !d3d12Fence || !swapChainBufferWrapped || !d3d11Context) {
-			if (shouldLog) {
-				logger::warn("[DX12SwapChain] Missing core interop resources, falling back to original Present");
-			}
-			return swapChain->Present(SyncInterval, Flags);
-		}
-
-		// Ensure D3D11 work is submitted before D3D12 takes over
-		d3d11Context->Flush();
-
-		// Strict Synchronization (Adopted from ENBFrameGeneration)
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Step 2: D3D11 Signal -> D3D12 Wait");
-		}
-		DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
-		DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
-		fenceValue++;
-
-		// Safety check for frameIndex and resources
-		if (frameIndex >= 3 || !commandAllocators[frameIndex] || !commandLists[frameIndex]) {
-			logger::error("[DX12SwapChain] Invalid frameIndex or NULL resources! frameIndex: {}, allocs: {}, lists: {}", 
-				frameIndex, (bool)commandAllocators[frameIndex], (bool)commandLists[frameIndex]);
-			return swapChain->Present(SyncInterval, Flags);
-		}
-
-		// New frame, reset
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Step 3: Command List Reset (frameIndex: {})", frameIndex);
-		}
-
-		// CPU-side wait to ensure the allocator is not in use by the GPU
-		if (d3d12Fence->GetCompletedValue() < frameFenceValues[frameIndex]) {
-			DX::ThrowIfFailed(d3d12Fence->SetEventOnCompletion(frameFenceValues[frameIndex], fenceEvent));
-			WaitForSingleObject(fenceEvent, INFINITE);
-		}
-
-		DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
-		DX::ThrowIfFailed(commandLists[frameIndex]->Reset(commandAllocators[frameIndex].get(), nullptr));
-
-		// Copy shared texture to swap chain buffer
-		// We ALWAYS copy to the backbuffer because FSR needs it for UI extraction/composition
-		{
-			auto fakeSwapChain = swapChainBufferWrapped->resource.get();
-			// Use the ACTUAL swapchain index for the destination to avoid flickering
-			UINT actualIndex = swapChain->GetCurrentBackBufferIndex();
-			
-			if (actualIndex < 3 && swapChainBuffers[actualIndex]) {
-				auto realSwapChain = swapChainBuffers[actualIndex].get();
-				
-				if (fakeSwapChain && realSwapChain) {
-					if (shouldLog) {
-						logger::info("[DX12SwapChain] Step 4: Resource Barriers & CopyResource (actualIndex: {})", actualIndex);
-					}
-					{
-						std::vector<D3D12_RESOURCE_BARRIER> barriers;
-						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
-						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
-						commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-					}
-
-					commandLists[frameIndex]->CopyResource(realSwapChain, fakeSwapChain);
-
-					{
-						std::vector<D3D12_RESOURCE_BARRIER> barriers;
-						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
-						barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
-						commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-					}
-				}
-			} else {
-				if (shouldLog) {
-					logger::warn("[DX12SwapChain] Step 4 Skipped: actualIndex {} out of bounds or buffer NULL", actualIndex);
-				}
-			}
-		}
-
-		// FSR 4.0: Transition shared resources to a state usable by FSR
-		if (upscaling_ptr->setupBuffers && !bypass) {
-			if (shouldLog) {
-				logger::info("[DX12SwapChain] Step 4.5: Transitioning shared resources for FSR");
-			}
-			std::vector<D3D12_RESOURCE_BARRIER> barriers;
-			if (upscaling_ptr->depthBufferShared && upscaling_ptr->depthBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->depthBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
-			if (upscaling_ptr->motionVectorBufferShared && upscaling_ptr->motionVectorBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->motionVectorBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
-			if (upscaling_ptr->HUDLessBufferShared && upscaling_ptr->HUDLessBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->HUDLessBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
-			if (upscaling_ptr->upscaledBufferShared && upscaling_ptr->upscaledBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->upscaledBufferShared->resource.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
-			
-			if (!barriers.empty())
-				commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-		}
-
-		if (upscaling_ptr->setupBuffers) {
-			if (shouldLog) {
-				logger::info("[DX12SwapChain] Step 5: FSR4Handler Present (bypass: {})", bypass);
-			}
-			FSR4SkyrimHandler::GetSingleton()->Present(upscaling_ptr->settings.frameGenerationMode, bypass);
-		} else {
-			if (shouldLog) {
-				logger::info("[DX12SwapChain] Step 5 Skipped: setupBuffers is false");
-			}
-			// Even if setupBuffers is false, we should call Present with bypass=true to keep the scheduler alive
-			FSR4SkyrimHandler::GetSingleton()->Present(upscaling_ptr->settings.frameGenerationMode, true);
-		}
-
-		// FSR 4.0: Transition shared resources back to COMMON for D3D11 interop
-		if (upscaling_ptr->setupBuffers && !bypass) {
-			std::vector<D3D12_RESOURCE_BARRIER> barriers;
-			if (upscaling_ptr->depthBufferShared && upscaling_ptr->depthBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->depthBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
-			if (upscaling_ptr->motionVectorBufferShared && upscaling_ptr->motionVectorBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->motionVectorBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
-			if (upscaling_ptr->HUDLessBufferShared && upscaling_ptr->HUDLessBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->HUDLessBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
-			if (upscaling_ptr->upscaledBufferShared && upscaling_ptr->upscaledBufferShared->resource)
-				barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(upscaling_ptr->upscaledBufferShared->resource.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
-			
-			if (!barriers.empty())
-				commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
-		}
-
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Step 6: ExecuteCommandLists");
-		}
-		DX::ThrowIfFailed(commandLists[frameIndex]->Close());
-
-		ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
-		commandQueue->ExecuteCommandLists(1, commandListsToExecute);
-
-		// Present the frame
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Step 7: swapChain->Present");
-		}
-		HRESULT hr = swapChain->Present(0, Flags);
-
-		if (FAILED(hr)) {
-			logger::critical("[DX12SwapChain] swapChain->Present failed! HRESULT: 0x{:X}", (uint32_t)hr);
-			return hr;
-		}
-
-		// Update frame fence value for this allocator
-		frameFenceValues[frameIndex] = fenceValue;
-		DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
-
-		// Wait for D3D12 to finish (GPU-side sync for D3D11)
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Step 8: D3D12 Signal -> D3D11 Wait");
-		}
-		DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
-		fenceValue++;
-
-		if (shouldLog) {
-			logger::info("[DX12SwapChain] Present End. Next frameIndex: {}", swapChain->GetCurrentBackBufferIndex());
-		}
-
-		// Update the frame index (Return to system-managed index)
-		frameIndex = swapChain->GetCurrentBackBufferIndex();
-
-		// upscaling_ptr->FrameLimiter(); // Temporarily disabled to check if it's causing the "half FPS" issue
-
-		return hr;
-	} catch (const std::exception& e) {
-		logger::critical("[DX12SwapChain] Present: Exception occurred: {}", e.what());
-		return E_FAIL;
-	} catch (...) {
-		logger::critical("[DX12SwapChain] Present: Unknown exception occurred!");
-		return E_FAIL;
+	// Core interop check - this is a hard requirement
+	if (!d3d11Fence || !d3d12Fence || !swapChainBufferWrapped || !d3d11Context) {
+		logger::warn("[DX12SwapChain] Missing core interop resources");
+		return swapChain->Present(SyncInterval, Flags);
 	}
+
+	// Following ENBFrameGeneration: Call CopyBuffersToSharedResources before D3D11->D3D12 sync
+	upscaling_ptr->CopyBuffersToSharedResources();
+
+	// D3D11 Signal -> D3D12 Wait
+	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
+	fenceValue++;
+
+	// Reset command list
+	DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
+	DX::ThrowIfFailed(commandLists[frameIndex]->Reset(commandAllocators[frameIndex].get(), nullptr));
+
+	// Copy shared texture to swap chain buffer
+	{
+		auto fakeSwapChain = swapChainBufferWrapped->resource.get();
+		auto realSwapChain = swapChainBuffers[frameIndex].get();
+		
+		if (fakeSwapChain && realSwapChain) {
+			std::vector<D3D12_RESOURCE_BARRIER> barriers;
+			barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+			barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
+			commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+
+			commandLists[frameIndex]->CopyResource(realSwapChain, fakeSwapChain);
+
+			barriers.clear();
+			barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(fakeSwapChain, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
+			barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(realSwapChain, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
+			commandLists[frameIndex]->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+		}
+	}
+
+	// Following ENBFrameGeneration: NO barriers needed for shared resources
+	// Our resources are created with D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS
+	// which allows D3D11 and D3D12 to access them without explicit state transitions
+
+	// Call FSR Present
+	auto handler = FSR4SkyrimHandler::GetSingleton();
+	if (handler) {
+		handler->Present(upscaling_ptr->settings.frameGenerationMode, false);
+	}
+
+	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
+
+	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
+	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
+
+	// Present the frame
+	HRESULT hr = swapChain->Present(0, Flags);
+
+	// D3D12 Signal -> D3D11 Wait
+	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
+	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
+	fenceValue++;
+
+	// Update the frame index
+	frameIndex = swapChain->GetCurrentBackBufferIndex();
+
+	return hr;
 }
 
 HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
@@ -441,10 +333,25 @@ DXGISwapChainProxy::DXGISwapChainProxy(IDXGISwapChain4* a_swapChain)
 /****IUknown****/
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::QueryInterface(REFIID riid, void** ppvObj)
 {
-	auto ret = swapChain->QueryInterface(riid, ppvObj);
-	if (*ppvObj)
+	if (ppvObj == nullptr) return E_POINTER;
+
+	// Standard Proxy pattern: If the game asks for any DXGI SwapChain interface, return OURSELVES.
+	if (riid == __uuidof(IUnknown) ||
+		riid == __uuidof(IDXGIObject) ||
+		riid == __uuidof(IDXGIDeviceSubObject) ||
+		riid == __uuidof(IDXGISwapChain) ||
+		riid == __uuidof(IDXGISwapChain1) ||
+		riid == __uuidof(IDXGISwapChain2) ||
+		riid == __uuidof(IDXGISwapChain3) ||
+		riid == __uuidof(IDXGISwapChain4)) {
+		AddRef();
 		*ppvObj = this;
-	return ret;
+		return S_OK;
+	}
+
+	// For anything else (like undocumented ENB interfaces or DXGI 1.6+ features we don't proxy yet), 
+	// let the real swapchain handle it. Note: This might return a pointer that bypasses our proxy!
+	return swapChain->QueryInterface(riid, ppvObj);
 }
 
 ULONG STDMETHODCALLTYPE DXGISwapChainProxy::AddRef()
@@ -512,7 +419,69 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
-	return swapChain->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+	logger::info("[DXGISwapChainProxy] ResizeBuffers called: {}x{}, BufferCount: {}, Format: {}", Width, Height, BufferCount, (int)NewFormat);
+	LOG_FLUSH();
+
+	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+	auto upscaling_ptr = Upscaling::GetSingleton();
+
+	// 1. Flush D3D11 and D3D12 to ensure GPU is done with resources
+	if (dx12SwapChain->d3d11Context) {
+		dx12SwapChain->d3d11Context->Flush();
+		// Wait for all GPU work to finish
+		if (dx12SwapChain->d3d11Fence) {
+			dx12SwapChain->d3d11Context->Signal(dx12SwapChain->d3d11Fence.get(), dx12SwapChain->fenceValue);
+			while (dx12SwapChain->d3d12Fence->GetCompletedValue() < dx12SwapChain->fenceValue) {
+				SwitchToThread();
+			}
+			dx12SwapChain->fenceValue++;
+		}
+	}
+
+	// 2. Release internal buffers that depend on SwapChain size
+	for (int i = 0; i < 3; i++) {
+		dx12SwapChain->swapChainBuffers[i] = nullptr;
+	}
+	if (dx12SwapChain->swapChainBufferWrapped) {
+		delete dx12SwapChain->swapChainBufferWrapped;
+		dx12SwapChain->swapChainBufferWrapped = nullptr;
+	}
+
+	// 3. Inform Upscaling to release its resources
+	// CRITICAL: We MUST null out the shared resources so FSR doesn't try to use them with new resolution
+	upscaling_ptr->setupBuffers = false;
+	if (upscaling_ptr->HUDLessBufferShared) { delete upscaling_ptr->HUDLessBufferShared; upscaling_ptr->HUDLessBufferShared = nullptr; }
+	if (upscaling_ptr->upscaledBufferShared) { delete upscaling_ptr->upscaledBufferShared; upscaling_ptr->upscaledBufferShared = nullptr; }
+	if (upscaling_ptr->depthBufferShared) { delete upscaling_ptr->depthBufferShared; upscaling_ptr->depthBufferShared = nullptr; }
+	if (upscaling_ptr->motionVectorBufferShared) { delete upscaling_ptr->motionVectorBufferShared; upscaling_ptr->motionVectorBufferShared = nullptr; }
+
+	// 4. Call original ResizeBuffers
+	HRESULT hr = swapChain->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+	
+	if (SUCCEEDED(hr)) {
+		// 5. Update internal desc
+		swapChain->GetDesc1(&dx12SwapChain->swapChainDesc);
+		
+		// 6. Re-acquire backbuffers
+		// BufferCount can be 0 (meaning no change), so we should use the actual count from the swapchain
+		UINT actualBufferCount = dx12SwapChain->swapChainDesc.BufferCount;
+		for (UINT i = 0; i < actualBufferCount && i < 3; i++) {
+			DX::ThrowIfFailed(swapChain->GetBuffer(i, IID_PPV_ARGS(&dx12SwapChain->swapChainBuffers[i])));
+			logger::info("[DXGISwapChainProxy] Re-acquired Buffer {}", i);
+		}
+		dx12SwapChain->frameIndex = swapChain->GetCurrentBackBufferIndex();
+
+		// 7. Re-create Interop
+		dx12SwapChain->CreateInterop();
+
+		logger::info("[DXGISwapChainProxy] ResizeBuffers successfully handled.");
+		LOG_FLUSH();
+	} else {
+		logger::error("[DXGISwapChainProxy] ResizeBuffers failed! HRESULT: 0x{:X}", (uint32_t)hr);
+		LOG_FLUSH();
+	}
+
+	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeTarget(_In_ const DXGI_MODE_DESC* pNewTargetParameters)

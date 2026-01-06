@@ -63,3 +63,12 @@ WrappedResource::WrappedResource(D3D11_TEXTURE2D_DESC a_texDesc, ID3D11Device5* 
 	logger::info("[WrappedResource] Resource created successfully.");
 	LOG_FLUSH();
 }
+
+WrappedResource::~WrappedResource()
+{
+	if (srv) { srv->Release(); srv = nullptr; }
+	if (uav) { uav->Release(); uav = nullptr; }
+	if (rtv) { rtv->Release(); rtv = nullptr; }
+	if (resource11) { resource11->Release(); resource11 = nullptr; }
+	resource = nullptr;
+}

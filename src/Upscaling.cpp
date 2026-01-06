@@ -3,11 +3,19 @@
 
 #include <d3dcompiler.h>
 #include <filesystem>
+#include <cmath>
 
 #include "DX12SwapChain.h"
 #include "Hooks.h"
 
 #include <ClibUtil/simpleINI.hpp>
+
+static void SetDirtyStates(bool a_computeShader)
+{
+	using func_t = void (*)(bool);
+	static REL::Relocation<func_t> func{ REL::RelocationID(75580, 77386) };
+	func(a_computeShader);
+}
 
 void Upscaling::LoadINI()
 {
@@ -126,38 +134,44 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
 
 void Upscaling::UpdateJitter()
 {
-	if (!d3d12Interop)
+	if (!d3d12Interop) {
 		return;
+	}
+
+	// Reset earlyCopy flag at the start of jitter update (frame start)
+	earlyCopy = false;
 
 	try {
 		auto state = RE::BSGraphics::State::GetSingleton();
-		if (!state)
+		if (!state) {
 			return;
+		}
 
 		auto gameViewport = reinterpret_cast<StateEx*>(state);
 
 		auto ffx = FSR4SkyrimHandler::GetSingleton();
-		if (!ffx->upscaleInitialized)
+		if (!ffx->upscaleInitialized) {
 			return;
-
-		static bool loggedOnce = false;
-		if (!loggedOnce) {
-			auto dx12SwapChain = DX12SwapChain::GetSingleton();
-			logger::info("[Upscaling] UpdateJitter: First call. FrameCount: {}, Res: {}x{}", 
-				gameViewport->frameCount, dx12SwapChain->swapChainDesc.Width, dx12SwapChain->swapChainDesc.Height);
-			LOG_FLUSH();
-			loggedOnce = true;
 		}
+
+		// Log every 300 frames to confirm jitter is updating
+		bool shouldLogJitter = (gameViewport->frameCount % 300 == 0);
 
 		ffxQueryDescUpscaleGetJitterOffset queryDesc = {};
 		queryDesc.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET;
-		queryDesc.index = gameViewport->frameCount;
+		// Now using CORRECT frameCount offset (0x4C) from ArranzCNL/CommonLibSSE-NG
+		queryDesc.index = gameViewport->frameCount; 
 		queryDesc.phaseCount = 8;
 		queryDesc.pOutX = &jitter.x;
 		queryDesc.pOutY = &jitter.y;
 
-		if (ffx::Query(ffx->upscaleContext, queryDesc) != ffx::ReturnCode::Ok)
+		auto queryResult = ffx::Query(ffx->upscaleContext, queryDesc);
+		if (queryResult != ffx::ReturnCode::Ok) {
+			if (shouldLogJitter) {
+				logger::warn("[Upscaling] UpdateJitter: Query failed! Result: {}", (int)queryResult);
+			}
 			return;
+		}
 
 		auto dx12SwapChain = DX12SwapChain::GetSingleton();
 		uint32_t screenWidth = dx12SwapChain->swapChainDesc.Width;
@@ -166,14 +180,13 @@ void Upscaling::UpdateJitter()
 		if (screenWidth == 0 || screenHeight == 0)
 			return;
 
+		// Now writing to CORRECT offsets (0x44, 0x48)
 		gameViewport->projectionPosScaleX = -2.0f * jitter.x / (float)screenWidth;
 		gameViewport->projectionPosScaleY = 2.0f * jitter.y / (float)screenHeight;
 		
-		static bool loggedJitter = false;
-		if (!loggedJitter) {
-			logger::info("[Upscaling] Jitter calculated and applied: {}, {}", jitter.x, jitter.y);
-			LOG_FLUSH();
-			loggedJitter = true;
+		if (shouldLogJitter) {
+			logger::info("[Upscaling] UpdateJitter: frameCount={}, jitter=({:.4f}, {:.4f}), projScale=({:.6f}, {:.6f})", 
+				gameViewport->frameCount, jitter.x, jitter.y, gameViewport->projectionPosScaleX, gameViewport->projectionPosScaleY);
 		}
 	} catch (const std::exception& e) {
 		logger::critical("[Upscaling] UpdateJitter Exception: {}", e.what());
@@ -182,6 +195,40 @@ void Upscaling::UpdateJitter()
 		logger::critical("[Upscaling] UpdateJitter Unknown Exception");
 		LOG_FLUSH();
 	}
+}
+
+void Upscaling::InvalidateResources()
+{
+	logger::info("[Upscaling] InvalidateResources: Releasing shared resources...");
+	LOG_FLUSH();
+	
+	// Mark buffers as not setup - this will trigger recreation on next frame
+	setupBuffers = false;
+	
+	// Release all shared resources to prevent stale pointer access
+	// These will be recreated in CreateFrameGenerationResources on next valid frame
+	if (HUDLessBufferShared) {
+		delete HUDLessBufferShared;
+		HUDLessBufferShared = nullptr;
+	}
+	if (upscaledBufferShared) {
+		delete upscaledBufferShared;
+		upscaledBufferShared = nullptr;
+	}
+	if (depthBufferShared) {
+		delete depthBufferShared;
+		depthBufferShared = nullptr;
+	}
+	if (motionVectorBufferShared) {
+		delete motionVectorBufferShared;
+		motionVectorBufferShared = nullptr;
+	}
+	
+	// Reset early copy flag
+	earlyCopy = false;
+	
+	logger::info("[Upscaling] InvalidateResources: All shared resources released.");
+	LOG_FLUSH();
 }
 
 void Upscaling::CreateFrameGenerationResources()
@@ -240,10 +287,16 @@ void Upscaling::CreateFrameGenerationResources()
 		depthBufferShared = new WrappedResource(texDesc, dx12SwapChain->d3d11Device.get(), dx12SwapChain->d3d12Device.get());
 
 		// Motion Vectors (Original Format)
+		auto& motionVectorRT = renderer->data.renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
+		if (!motionVectorRT.texture) {
+			logger::error("[Upscaling] Motion vector texture is NULL during resource creation!");
+			setupBuffers = false;
+			return;
+		}
 		D3D11_TEXTURE2D_DESC texDescMV{};
-		motionVector.texture->GetDesc(&texDescMV);
+		motionVectorRT.texture->GetDesc(&texDescMV);
 		texDesc.Format = texDescMV.Format;
-		logger::info("[Upscaling] Creating motionVectorBufferShared...");
+		logger::info("[Upscaling] Creating motionVectorBufferShared (Format: {})...", (int)texDesc.Format);
 		LOG_FLUSH();
 		motionVectorBufferShared = new WrappedResource(texDesc, dx12SwapChain->d3d11Device.get(), dx12SwapChain->d3d12Device.get());
 
@@ -301,12 +354,17 @@ void Upscaling::EarlyCopyBuffersToSharedResources()
 			return;
 		logger::info("[Upscaling] Initializing frame generation resources (Early)...");
 		CreateFrameGenerationResources();
+		if (!setupBuffers) return;
 	}
 
-	auto context = DX::GetContext();
+	// Following ENBFrameGeneration: Use renderer's context
+	auto context = reinterpret_cast<ID3D11DeviceContext*>(renderer->data.context);
+	if (!context) return;
+	
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 
-	if (RE::UI::GetSingleton()->GameIsPaused())
+	auto ui = RE::UI::GetSingleton();
+	if (ui && ui->GameIsPaused())
 	{
 		float clearColor[4] = { 0, 0, 0, 0 };
 		if (motionVectorBufferShared && motionVectorBufferShared->rtv)
@@ -314,11 +372,103 @@ void Upscaling::EarlyCopyBuffersToSharedResources()
 	} else {
 		auto& motionVector = renderer->data.renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
 		if (motionVector.texture && motionVectorBufferShared && motionVectorBufferShared->resource11) {
-			context->CopyResource(motionVectorBufferShared->resource11, motionVector.texture);
+			context->CopyResource(motionVectorBufferShared->resource11, (ID3D11Resource*)motionVector.texture);
+			
+			// DIAGNOSTIC: Sample MV pixels to check if they contain valid data
+			static uint64_t mvCopyLogCounter = 0;
+			if (mvCopyLogCounter++ % 300 == 0) {
+				D3D11_TEXTURE2D_DESC mvDesc;
+				((ID3D11Texture2D*)motionVector.texture)->GetDesc(&mvDesc);
+				logger::info("[Upscaling] MV Copy: src={:p} ({}x{}, fmt={}), dst={:p}",
+					(void*)motionVector.texture, mvDesc.Width, mvDesc.Height, (int)mvDesc.Format,
+					(void*)motionVectorBufferShared->resource11);
+				
+				// Read MV pixel values via staging texture
+				ID3D11Device* device = nullptr;
+				context->GetDevice(&device);
+				if (device) {
+					D3D11_TEXTURE2D_DESC stagingDesc = mvDesc;
+					stagingDesc.Width = 4;  // Only sample 4x4 pixels
+					stagingDesc.Height = 4;
+					stagingDesc.MipLevels = 1;
+					stagingDesc.ArraySize = 1;
+					stagingDesc.Usage = D3D11_USAGE_STAGING;
+					stagingDesc.BindFlags = 0;
+					stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+					stagingDesc.MiscFlags = 0;
+					
+					ID3D11Texture2D* stagingTex = nullptr;
+					if (SUCCEEDED(device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex))) {
+						// Copy center region of MV texture
+						D3D11_BOX srcBox;
+						srcBox.left = mvDesc.Width / 2 - 2;
+						srcBox.right = mvDesc.Width / 2 + 2;
+						srcBox.top = mvDesc.Height / 2 - 2;
+						srcBox.bottom = mvDesc.Height / 2 + 2;
+						srcBox.front = 0;
+						srcBox.back = 1;
+						context->CopySubresourceRegion(stagingTex, 0, 0, 0, 0, (ID3D11Texture2D*)motionVector.texture, 0, &srcBox);
+						
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+							// R16G16_FLOAT: 2 half-floats per pixel (4 bytes)
+							uint16_t* data = (uint16_t*)mapped.pData;
+							// Sample center pixel (index 1,1 in 4x4 grid)
+							uint32_t pixelOffset = (1 * (mapped.RowPitch / 4)) + 1 * 2;
+							uint16_t mvX_half = data[pixelOffset];
+							uint16_t mvY_half = data[pixelOffset + 1];
+							
+							// Convert half-float to float (approximate)
+							auto halfToFloat = [](uint16_t h) -> float {
+								uint32_t sign = (h >> 15) & 0x1;
+								uint32_t exp = (h >> 10) & 0x1F;
+								uint32_t mant = h & 0x3FF;
+								if (exp == 0) return sign ? -0.0f : 0.0f;
+								if (exp == 31) return sign ? -INFINITY : INFINITY;
+								float f = (1.0f + mant / 1024.0f) * powf(2.0f, (float)exp - 15);
+								return sign ? -f : f;
+							};
+							
+							float mvX = halfToFloat(mvX_half);
+							float mvY = halfToFloat(mvY_half);
+							
+							logger::info("[Upscaling] MV Center Pixel: X={:.4f}, Y={:.4f} (raw: 0x{:04X}, 0x{:04X})",
+								mvX, mvY, mvX_half, mvY_half);
+							
+							// Also sample a few more pixels
+							float sumX = 0, sumY = 0;
+							int count = 0;
+							for (int y = 0; y < 4; y++) {
+								for (int x = 0; x < 4; x++) {
+									uint32_t off = (y * (mapped.RowPitch / 4)) + x * 2;
+									sumX += halfToFloat(data[off]);
+									sumY += halfToFloat(data[off + 1]);
+									count++;
+								}
+							}
+							logger::info("[Upscaling] MV 4x4 Average: X={:.4f}, Y={:.4f}", sumX/count, sumY/count);
+							
+							context->Unmap(stagingTex, 0);
+						}
+						stagingTex->Release();
+					}
+					device->Release();
+				}
+			}
+		} else {
+			// DIAGNOSTIC: Log why MV copy was skipped
+			static uint64_t mvSkipLogCounter = 0;
+			if (mvSkipLogCounter++ % 300 == 0) {
+				logger::warn("[Upscaling] MV Copy SKIPPED: motionVector.texture={:p}, motionVectorBufferShared={:p}, resource11={:p}",
+					(void*)motionVector.texture,
+					(void*)motionVectorBufferShared,
+					motionVectorBufferShared ? (void*)motionVectorBufferShared->resource11 : nullptr);
+			}
 		}
 	}
 
 	{
+		// Use kPOST_ZPREPASS_COPY (index 8) for stability as it is a dedicated copy for shader sampling
 		auto& depth = renderer->data.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 		if (depth.depthSRV && copyDepthToSharedBufferCS && depthBufferShared && depthBufferShared->uav) {
 			uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
@@ -334,6 +484,7 @@ void Upscaling::EarlyCopyBuffersToSharedResources()
 
 			context->Dispatch(dispatchX, dispatchY, 1);
 
+			// Explicitly clear states instead of potentially crashing SetDirtyStates during loading
 			ID3D11ShaderResourceView* nullViews[1] = { nullptr };
 			context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
 
@@ -353,8 +504,20 @@ void Upscaling::CopyBuffersToSharedResources()
 	if (!d3d12Interop)
 		return;
 
+	// Following ENBFrameGeneration pattern: Do NOT check PlayerCamera here.
+	// ENBFrameGeneration trusts that if TAA_EndTechnique is called, the resources are valid.
+
+	auto state = RE::BSGraphics::State::GetSingleton();
+	if (!state) return;
+
+	auto gameViewport = reinterpret_cast<StateEx*>(state);
+	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+
+	// Log frequently for the first 200 frames to catch early crashes
+	bool shouldLog = (dx12SwapChain->frameCounter < 200) || (gameViewport->frameCount % 600 == 0);
+
 	try {
-		auto dx12SwapChain = DX12SwapChain::GetSingleton();
+		// Following ENBFrameGeneration: Use renderer's context directly
 		auto renderer = RE::BSGraphics::Renderer::GetSingleton();
 		if (!renderer) {
 			return;
@@ -365,7 +528,7 @@ void Upscaling::CopyBuffersToSharedResources()
 			if (!main.texture) {
 				return;
 			}
-			logger::info("[Upscaling] Initializing frame generation resources...");
+			logger::info("[Upscaling] Initializing frame generation resources... Frame: {}", gameViewport->frameCount);
 			LOG_FLUSH();
 			CreateFrameGenerationResources();
 			if (!setupBuffers) {
@@ -373,47 +536,138 @@ void Upscaling::CopyBuffersToSharedResources()
 			}
 		}
 
-		auto context = DX::GetContext();
+		// Following ENBFrameGeneration: Use renderer's context, NOT dx12SwapChain's context
+		ID3D11DeviceContext* context = reinterpret_cast<ID3D11DeviceContext*>(renderer->data.context);
+		if (!context) return;
 
-		// 1. Motion Vectors
-		if (!RE::UI::GetSingleton()->GameIsPaused()) {
-			auto& motionVector = renderer->data.renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
-			if (motionVector.texture && motionVectorBufferShared && motionVectorBufferShared->resource11) {
-				context->CopyResource(motionVectorBufferShared->resource11, motionVector.texture);
+		// 1. Motion Vectors & Depth (Only copy if not already done by EarlyCopy/Main_RenderWorld)
+		if (!earlyCopy) {
+			auto ui = RE::UI::GetSingleton();
+			if (ui && !ui->GameIsPaused()) {
+				auto& motionVector = renderer->data.renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
+				if (motionVector.texture && motionVectorBufferShared && motionVectorBufferShared->resource11) {
+					if (shouldLog) logger::info("[Upscaling] Copying Motion Vectors (TAA_End)...");
+					context->CopyResource(motionVectorBufferShared->resource11, (ID3D11Resource*)motionVector.texture);
+					
+					// DIAGNOSTIC: Sample MV at TAA_End to compare with EarlyCopy
+					static uint64_t mvTaaLogCounter = 0;
+					if (mvTaaLogCounter++ % 300 == 0) {
+						D3D11_TEXTURE2D_DESC mvDesc;
+						((ID3D11Texture2D*)motionVector.texture)->GetDesc(&mvDesc);
+						
+						ID3D11Device* device = nullptr;
+						context->GetDevice(&device);
+						if (device) {
+							D3D11_TEXTURE2D_DESC stagingDesc = mvDesc;
+							stagingDesc.Width = 4;
+							stagingDesc.Height = 4;
+							stagingDesc.MipLevels = 1;
+							stagingDesc.ArraySize = 1;
+							stagingDesc.Usage = D3D11_USAGE_STAGING;
+							stagingDesc.BindFlags = 0;
+							stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+							stagingDesc.MiscFlags = 0;
+							
+							ID3D11Texture2D* stagingTex = nullptr;
+							if (SUCCEEDED(device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex))) {
+								D3D11_BOX srcBox;
+								srcBox.left = mvDesc.Width / 2 - 2;
+								srcBox.right = mvDesc.Width / 2 + 2;
+								srcBox.top = mvDesc.Height / 2 - 2;
+								srcBox.bottom = mvDesc.Height / 2 + 2;
+								srcBox.front = 0;
+								srcBox.back = 1;
+								context->CopySubresourceRegion(stagingTex, 0, 0, 0, 0, (ID3D11Texture2D*)motionVector.texture, 0, &srcBox);
+								
+								D3D11_MAPPED_SUBRESOURCE mapped;
+								if (SUCCEEDED(context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+									uint16_t* data = (uint16_t*)mapped.pData;
+									uint32_t pixelOffset = (1 * (mapped.RowPitch / 4)) + 1 * 2;
+									uint16_t mvX_half = data[pixelOffset];
+									uint16_t mvY_half = data[pixelOffset + 1];
+									
+									auto halfToFloat = [](uint16_t h) -> float {
+										uint32_t sign = (h >> 15) & 0x1;
+										uint32_t exp = (h >> 10) & 0x1F;
+										uint32_t mant = h & 0x3FF;
+										if (exp == 0) return sign ? -0.0f : 0.0f;
+										if (exp == 31) return sign ? -INFINITY : INFINITY;
+										float f = (1.0f + mant / 1024.0f) * powf(2.0f, (float)exp - 15);
+										return sign ? -f : f;
+									};
+									
+									float mvX = halfToFloat(mvX_half);
+									float mvY = halfToFloat(mvY_half);
+									logger::info("[Upscaling] MV at TAA_End: X={:.4f}, Y={:.4f} (raw: 0x{:04X}, 0x{:04X})",
+										mvX, mvY, mvX_half, mvY_half);
+									context->Unmap(stagingTex, 0);
+								}
+								stagingTex->Release();
+							}
+							device->Release();
+						}
+					}
+				}
+			}
+
+			// 2. Depth
+			{
+				// Use kPOST_ZPREPASS_COPY as it's the depth copy intended for shader reading
+				// Index 8 in SE 1.5.97
+				auto& depth = renderer->data.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+				
+				// FSR 4.0: Extra safety check for depth SRV
+				if (depth.depthSRV && copyDepthToSharedBufferCS && depthBufferShared && depthBufferShared->uav) {
+					if (shouldLog) logger::info("[Upscaling] Copying Depth (kPOST_ZPREPASS_COPY)...");
+					uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
+					uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
+
+					ID3D11ShaderResourceView* views[1] = { depth.depthSRV };
+					context->CSSetShaderResources(0, ARRAYSIZE(views), views);
+					ID3D11UnorderedAccessView* uavs[1] = { depthBufferShared->uav };
+					context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+					context->CSSetShader(copyDepthToSharedBufferCS, nullptr, 0);
+					context->Dispatch(dispatchX, dispatchY, 1);
+
+					ID3D11ShaderResourceView* nullViews[1] = { nullptr };
+					context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
+					ID3D11UnorderedAccessView* nullUavs[1] = { nullptr };
+					context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
+					context->CSSetShader(nullptr, nullptr, 0);
+
+					// Note: ENBFrameGeneration does NOT call SetDirtyStates here
+					// Removed to match reference implementation and avoid potential crashes during loading
+				}
 			}
 		}
 
-		// 2. Depth
+		// 3. HUDLess (Backbuffer before UI) - Following ENBFrameGeneration: use SRV->GetResource
 		{
-			// Use kMAIN_DEPTH instead of kPOST_ZPREPASS_COPY as it's more reliable during transitions
-			auto& depth = renderer->data.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN_DEPTH];
-			if (depth.depthSRV && copyDepthToSharedBufferCS && depthBufferShared && depthBufferShared->uav) {
-				uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
-				uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
-
-				ID3D11ShaderResourceView* views[1] = { depth.depthSRV };
-				context->CSSetShaderResources(0, ARRAYSIZE(views), views);
-				ID3D11UnorderedAccessView* uavs[1] = { depthBufferShared->uav };
-				context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
-				context->CSSetShader(copyDepthToSharedBufferCS, nullptr, 0);
-				context->Dispatch(dispatchX, dispatchY, 1);
-
-				ID3D11ShaderResourceView* nullViews[1] = { nullptr };
-				context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
-				ID3D11UnorderedAccessView* nullUavs[1] = { nullptr };
-				context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
-				context->CSSetShader(nullptr, nullptr, 0);
+			// Framebuffer is Index 0 and contains the scene before UI if called at EndTechnique
+			auto& framebuffer = renderer->data.renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
+			if (framebuffer.SRV && HUDLessBufferShared && HUDLessBufferShared->resource11) {
+				ID3D11Resource* framebufferResource = nullptr;
+				framebuffer.SRV->GetResource(&framebufferResource);
+				if (framebufferResource) {
+					if (shouldLog) logger::info("[Upscaling] Copying HUDLess Color via SRV...");
+					context->CopyResource(HUDLessBufferShared->resource11, framebufferResource);
+					framebufferResource->Release(); // GetResource adds a reference
+				}
 			}
 		}
 
-		// 3. HUDLess (Backbuffer before UI)
-		auto& framebuffer = renderer->data.renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
-		if (framebuffer.texture && HUDLessBufferShared && HUDLessBufferShared->resource11) {
-			context->CopyResource(HUDLessBufferShared->resource11, framebuffer.texture);
-		}
+		// Following ENBFrameGeneration: Reset earlyCopy at the END of CopyBuffersToSharedResources
+		earlyCopy = false;
 
+		if (shouldLog) {
+			logger::info("[Upscaling] CopyBuffersToSharedResources Complete. Frame: {}", gameViewport->frameCount);
+			LOG_FLUSH();
+		}
+	} catch (const std::exception& e) {
+		logger::critical("[Upscaling] CopyBuffersToSharedResources: Exception: {}", e.what());
+		LOG_FLUSH();
 	} catch (...) {
-		logger::critical("[Upscaling] CopyBuffersToSharedResources: Unknown exception!");
+		logger::critical("[Upscaling] CopyBuffersToSharedResources: Unknown Exception!");
 		LOG_FLUSH();
 	}
 }

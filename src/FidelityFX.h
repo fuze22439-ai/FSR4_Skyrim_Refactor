@@ -32,7 +32,12 @@ public:
 	bool upscaleInitialized = false;
 	bool frameGenInitialized = false;
 	bool swapChainContextInitialized = false;
-	bool lastBypass = true;
+	uint64_t currentFSRFrameID = 1;
+	
+	// Reset flag for scene transitions (load game, fast travel, etc.)
+	bool needsReset = true;  // Start with reset to handle initial frames
+	
+	void RequestReset() { needsReset = true; }
 
 	void LoadFFX();
 	void SetupFrameGeneration();

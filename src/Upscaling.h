@@ -1,17 +1,22 @@
 #pragma once
 
 #include <shared_mutex>
+#include <atomic>
 #include "FidelityFX.h"
 #include "WrappedResource.h"
 
 // Memory layout fix for Skyrim SE (1.5.97)
+// Correct offsets from ArranzCNL/CommonLibSSE-NG
 struct StateEx
 {
-	uint8_t  pad00[0x98];          // 0x00
-	uint32_t frameCount;           // 0x98
-	uint8_t  pad9C[0x240 - 0x9C];  // 0x9C
-	float    projectionPosScaleX;  // 0x240
-	float    projectionPosScaleY;  // 0x244
+	uint8_t  pad00[0x34];          // 0x00
+	uint32_t unk34;                // 0x34
+	uint32_t unk38;                // 0x38
+	float    unknown[2];           // 0x3C
+	float    projectionPosScaleX;  // 0x44
+	float    projectionPosScaleY;  // 0x48
+	uint32_t frameCount;           // 0x4C (uiFrameCount)
+	bool     insideFrame;          // 0x50
 };
 
 namespace RE
@@ -63,6 +68,9 @@ public:
 	bool earlyCopy = false;
 
 	bool setupBuffers = false;
+	
+	// Thread-safe flag for resource invalidation during game state changes (Load/New/DataLoaded)
+	std::atomic<bool> resourcesInvalidated{ false };
 
 	struct Jitter
 	{
@@ -74,6 +82,7 @@ public:
 
 	void UpdateJitter();
 	void CreateFrameGenerationResources();
+	void InvalidateResources();
 	void EarlyCopyBuffersToSharedResources();
 	void CopyBuffersToSharedResources();
 	void PostDisplay();

@@ -186,5 +186,12 @@ namespace Hooks
 			logger::info("[Hooks] ENB detected, ensuring IAT hook is applied to enbseries.dll as well");
 			SKSE::PatchIAT(hk_D3D11CreateDeviceAndSwapChain, "enbseries.dll", "D3D11CreateDeviceAndSwapChain");
 		}
+
+		// MANDATORY: Main_RenderWorld hook (Bystander Protocol Support)
+		// This hook provides resource extraction in menus and scenes where TAA is not active.
+		// STRICT REFERENCE: ENBFrameGeneration implementation.
+		logger::info("[Hooks] Installing Main_RenderWorld hook...");
+		stl::write_thunk_call<Main_RenderWorld>(REL::RelocationID(35560, 36559).address() + REL::Relocate(0x831, 0x841, 0x791));
+		logger::info("[Hooks] Main_RenderWorld hook installed successfully.");
 	}
 }
