@@ -8,6 +8,7 @@ target_include_directories(
   "${FFX_SDK_ROOT}/Kits/FidelityFX/framegeneration/include"
   "${FFX_SDK_ROOT}/Kits/FidelityFX/upscalers/include"
   "${FFX_SDK_ROOT}/Kits/FidelityFX/backend/dx12"
+  "${FFX_SDK_ROOT}/Kits/OpenSource"  # Anti-Lag 2.0 SDK
 )
 
 target_link_libraries(

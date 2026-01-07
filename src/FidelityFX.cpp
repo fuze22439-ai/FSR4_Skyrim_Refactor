@@ -118,6 +118,9 @@ void FSR4SkyrimHandler::SetupFrameGeneration()
 			frameGenInitialized = true;
 		}
 	}
+	
+	// 4. Initialize Anti-Lag 2.0 (AMD only, will gracefully fail on non-AMD)
+	InitAntiLag(swapChain->d3d12Device.get());
 
 	// 4. Setup Upscale Context for Native AA
 	{
@@ -148,6 +151,56 @@ void FSR4SkyrimHandler::SetupFrameGeneration()
 	}
 }
 
+// ============================================================================
+// AMD Anti-Lag 2.0 Implementation
+// ============================================================================
+
+void FSR4SkyrimHandler::InitAntiLag(ID3D12Device* device)
+{
+	if (!device) return;
+	
+	// Zero-initialize context
+	memset(&antiLagContext, 0, sizeof(antiLagContext));
+	
+	HRESULT hr = AMD::AntiLag2DX12::Initialize(&antiLagContext, device);
+	if (SUCCEEDED(hr)) {
+		antiLagAvailable = true;
+		logger::info("[FSR4] AMD Anti-Lag 2.0 initialized successfully!");
+	} else {
+		antiLagAvailable = false;
+		// This is expected on non-AMD systems or older drivers
+		if (hr == E_HANDLE) {
+			logger::info("[FSR4] Anti-Lag 2.0 not available (non-AMD GPU or driver not supported)");
+		} else {
+			logger::info("[FSR4] Anti-Lag 2.0 initialization returned: 0x{:X}", (uint32_t)hr);
+		}
+	}
+}
+
+void FSR4SkyrimHandler::UpdateAntiLag()
+{
+	// Call this before input polling each frame
+	if (antiLagAvailable) {
+		// maxFPS = 0 means no frame rate limit from Anti-Lag
+		AMD::AntiLag2DX12::Update(&antiLagContext, antiLagEnabled, 0);
+	}
+}
+
+void FSR4SkyrimHandler::MarkEndOfRendering()
+{
+	// Call this after main rendering workload (after PrepareV2)
+	if (antiLagAvailable && antiLagEnabled) {
+		AMD::AntiLag2DX12::MarkEndOfFrameRendering(&antiLagContext);
+	}
+}
+
+void FSR4SkyrimHandler::SetFrameType(bool isInterpolated)
+{
+	// Call this before Present
+	if (antiLagAvailable && antiLagEnabled) {
+		AMD::AntiLag2DX12::SetFrameGenFrameType(&antiLagContext, isInterpolated);
+	}
+}
 
 
 // https://github.com/PureDark/Skyrim-Upscaler/blob/fa057bb088cf399e1112c1eaba714590c881e462/src/SkyrimUpscaler.cpp#L88
@@ -163,16 +216,10 @@ float GetVerticalFOVRad()
 
 static ffxReturnCode_t FrameGenerationCallback(ffxDispatchDescFrameGeneration* params, void* pUserCtx)
 {
-	// Detailed diagnostic log for frame generation
 	static uint64_t callCount = 0;
 	callCount++;
 	
-	// Log every 60 calls AND first 10 calls
-	bool shouldLog = (callCount % 60 == 0) || (callCount < 10);
-	if (shouldLog) {
-		logger::info("[FG_Callback] call#{}, frameID={}, numGenFrames={}, reset={}",
-			callCount, params->frameID, params->numGeneratedFrames, params->reset);
-	}
+	uint32_t numGenBefore = params->numGeneratedFrames;
 	
 	// Check if callback context is valid
 	if (!pUserCtx) {
@@ -180,9 +227,25 @@ static ffxReturnCode_t FrameGenerationCallback(ffxDispatchDescFrameGeneration* p
 		return FFX_API_RETURN_ERROR;
 	}
 	
+	// Anti-Lag 2.0: Indicate if this is an interpolated frame BEFORE Present
+	// numGeneratedFrames > 0 means FSR is generating interpolated frames
+	bool isInterpolatedFrame = (params->numGeneratedFrames > 0);
+	FSR4SkyrimHandler::GetSingleton()->SetFrameType(isInterpolatedFrame);
+	
 	// FSR 4.0: Match ENBFrameGeneration's minimal callback - let FSR handle pacing internally
 	// DO NOT modify params->numGeneratedFrames - it breaks FSR's frame pacing!
 	auto result = ffxDispatch(reinterpret_cast<ffxContext*>(pUserCtx), &params->header);
+	
+	uint32_t numGenAfter = params->numGeneratedFrames;
+	// Only warn if interpolation fails repeatedly
+	if (numGenAfter == 0 && numGenBefore > 0) {
+		static uint64_t zeroGenCount = 0;
+		zeroGenCount++;
+		if (zeroGenCount <= 5 || zeroGenCount % 300 == 0) {
+			logger::warn("[FG_Callback] Frame NOT interpolated! (count={})", zeroGenCount);
+		}
+	}
+	
 	if (result != FFX_API_RETURN_OK && callCount % 100 == 0) {
 		logger::error("[FG_Callback] ffxDispatch failed! Error: 0x{:X}", (uint32_t)result);
 	}
@@ -203,13 +266,8 @@ void FSR4SkyrimHandler::Present(bool a_useFrameGeneration, bool a_bypass)
 	auto swapChain = DX12SwapChain::GetSingleton();
 	auto commandList = swapChain->commandLists[swapChain->frameIndex].get();
 
-	bool shouldLog = (frameID < 200) || (frameID % 100 == 0);
-
-	// DIAGNOSTIC: Log every frame for first 20 frames to verify frameID increments by 1
+	bool shouldLog = false; // Release: Only log errors
 	static uint64_t lastLoggedFrameID = 0;
-	if (frameID < 20 || (frameID - lastLoggedFrameID != 1 && lastLoggedFrameID != 0)) {
-		logger::info("[FidelityFX] frameID={}, lastFrameID={}, diff={}", frameID, lastLoggedFrameID, frameID - lastLoggedFrameID);
-	}
 	lastLoggedFrameID = frameID;
 
 	// Get StateEx for reading projectionPosScaleX/Y (jitter)
@@ -238,19 +296,14 @@ void FSR4SkyrimHandler::Present(bool a_useFrameGeneration, bool a_bypass)
 		return;
 	}
 
-	// Track resource state changes (only log when state changes to reduce spam)
 	static bool lastResourcesReady = false;
 	if (resourcesReady != lastResourcesReady) {
-		logger::info("[FSR4SkyrimHandler] Resource state changed: {} -> {} at frame {}", 
-			lastResourcesReady, resourcesReady, frameID);
-		LOG_FLUSH();
+		logger::info("[FSR4] Resources {}", resourcesReady ? "ready" : "not ready");
 		lastResourcesReady = resourcesReady;
 	}
 
 	if (shouldLog) {
-		logger::info("[FSR4SkyrimHandler] Present Dispatch Start. frameID: {}, useFG: {}, resourcesReady: {}, deltaTime: {:.2f}ms", 
-			frameID, a_useFrameGeneration, resourcesReady, manualDeltaTime);
-		LOG_FLUSH();
+		logger::info("[FSR4] Frame {}: FG={}, dt={:.1f}ms", frameID, a_useFrameGeneration, manualDeltaTime);
 	}
 
 	// 1. Configure Pacing
@@ -265,66 +318,20 @@ void FSR4SkyrimHandler::Present(bool a_useFrameGeneration, bool a_bypass)
 		ffxConfigure(&swapChainContext, &tuning.header);
 	}
 
-	// 2. Configure Frame Generation (MANDATORY EVERY FRAME)
-	// Following ENBFrameGeneration: Enable FG based on user setting, NOT resource availability!
-	// FSR will use backbuffer if HUDLessColor is not provided.
-	if (frameGenInitialized) {
+	// Handle FG disabled case - must still configure to disable FG
+	if (!a_useFrameGeneration && frameGenInitialized) {
 		ffxConfigureDescFrameGeneration configParameters{};
 		memset(&configParameters, 0, sizeof(configParameters));
 		configParameters.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
 		configParameters.swapChain = swapChain->swapChain;
-		
-		// Following ENBFrameGeneration: Only check user setting, NOT resourcesReady!
-		if (a_useFrameGeneration) {
-			configParameters.frameGenerationEnabled = true;
-			configParameters.frameGenerationCallback = FrameGenerationCallback;
-			configParameters.frameGenerationCallbackUserContext = &frameGenContext;
-			
-			// Provide HUDLessColor if available, otherwise FSR uses backbuffer
-			if (resourcesReady) {
-				bool useAA = upscaleInitialized && (upscaling->settings.sharpness > 0.0f);
-				configParameters.HUDLessColor = ffxApiGetResourceDX12(useAA ? upscaledColor : HUDLessColor);
-			} else {
-				configParameters.HUDLessColor = FfxApiResource{};
-			}
-		} else {
-			// User disabled FG
-			configParameters.frameGenerationEnabled = false;
-			configParameters.frameGenerationCallbackUserContext = nullptr;
-			configParameters.frameGenerationCallback = nullptr;
-			configParameters.HUDLessColor = FfxApiResource{};
-		}
-		
+		configParameters.frameGenerationEnabled = false;
+		configParameters.frameGenerationCallback = nullptr;
+		configParameters.frameGenerationCallbackUserContext = nullptr;
+		configParameters.HUDLessColor = FfxApiResource{};
 		configParameters.frameID = frameID;
-		// CRITICAL: Following ENBFrameGeneration - must set onlyPresentGenerated = false
-		// This tells FSR to present BOTH original and generated frames
-		// Without this, FSR may only present generated frames or skip frames entirely
-		configParameters.onlyPresentGenerated = false;
-		// CRITICAL: Match ENBFrameGeneration - always true for best pacing
-		configParameters.allowAsyncWorkloads = true;
-		// Match ENBFrameGeneration: flags = 0 for production (no debug pacing lines)
-		configParameters.flags = 0;
-		configParameters.generationRect.left = 0;
-		configParameters.generationRect.top = 0;
-		configParameters.generationRect.width = swapChain->swapChainDesc.Width;
-		configParameters.generationRect.height = swapChain->swapChainDesc.Height;
-		
-		auto configResult = ffxConfigure(&frameGenContext, &configParameters.header);
-		if (configResult != FFX_API_RETURN_OK) {
-			logger::error("[FidelityFX] Failed to configure frame generation! Error: 0x{:X}", (uint32_t)configResult);
-		}
-		
-		// DIAGNOSTIC: Log Configure details every 300 frames
-		static uint64_t lastConfigLogFrame = 0;
-		if (frameID - lastConfigLogFrame >= 300) {
-			lastConfigLogFrame = frameID;
-			logger::info("[FidelityFX] Configure: swapChain={:p}, enabled={}, callback={:p}, onlyPresentGen={}, flags={}",
-				(void*)configParameters.swapChain,
-				configParameters.frameGenerationEnabled,
-				(void*)configParameters.frameGenerationCallback,
-				configParameters.onlyPresentGenerated,
-				configParameters.flags);
-		}
+		ffxConfigure(&frameGenContext, &configParameters.header);
+		currentFSRFrameID++;
+		return;
 	}
 
 	// Following ENBFrameGeneration: Dispatch PrepareV2 when user enables FG, regardless of resource availability
@@ -340,60 +347,70 @@ void FSR4SkyrimHandler::Present(bool a_useFrameGeneration, bool a_bypass)
 		if (cameraNearVal <= 0.0f) cameraNearVal = 0.1f;
 		if (cameraFarVal <= cameraNearVal) cameraFarVal = 100000.0f;
 
-		// Dispatch AA only when resources are actually ready
-		bool useAA = upscaleInitialized && resourcesReady && (upscaling->settings.sharpness > 0.0f);
+		// NOTE: AA is now executed synchronously in ReplaceTAA() via DispatchAASync()
+		// The upscaledColor buffer already contains the AA result when we reach here.
+		// skipTaaEnabled controls whether AA runs in ReplaceTAA.
+		bool aaWasExecutedInTAA = upscaling->skipTaaEnabled && upscaleInitialized && 
+		                          upscaledColor && resourcesReady;
 		
-		// DIAGNOSTIC: Log AA dispatch decision every 300 frames
 		static uint64_t aaLogCounter = 0;
-		if (aaLogCounter++ % 300 == 0) {
-			logger::info("[FidelityFX] AA Check: upscaleInit={}, resourcesReady={}, sharpness={:.2f}, useAA={}",
-				upscaleInitialized, resourcesReady, upscaling->settings.sharpness, useAA);
-		}
+		(void)aaLogCounter++; // Keep counter for potential debugging
 		
-		if (useAA) {
-			ffxDispatchDescUpscale upscaleDispatch{};
-			memset(&upscaleDispatch, 0, sizeof(upscaleDispatch));
-			upscaleDispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-			upscaleDispatch.commandList = commandList;
-			upscaleDispatch.color = ffxApiGetResourceDX12(HUDLessColor);
-			upscaleDispatch.depth = ffxApiGetResourceDX12(depth);
-			upscaleDispatch.motionVectors = ffxApiGetResourceDX12(motionVectors);
-			upscaleDispatch.output = ffxApiGetResourceDX12(upscaledColor, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+		// ========================================================================
+		// STEP 2: AA is now executed in ReplaceTAA() - NO AA dispatch here!
+		// This ensures AA result is available BEFORE FG Configure
+		// ========================================================================
+		// (Removed AA dispatch from Present - it now runs synchronously in TAA hook)
 
-			// Read jitter from projectionPosScaleX/Y like ENBFrameGeneration does
-			if (stateEx) {
-				upscaleDispatch.jitterOffset.x = stateEx->projectionPosScaleX * (float)swapChain->swapChainDesc.Width / 2.0f;
-				upscaleDispatch.jitterOffset.y = stateEx->projectionPosScaleY * (float)swapChain->swapChainDesc.Height / 2.0f;
+		// ========================================================================
+		// STEP 3: Configure FG - use AA output (upscaledColor) if AA was executed
+		// ========================================================================
+		{
+			ffxConfigureDescFrameGeneration configParameters{};
+			memset(&configParameters, 0, sizeof(configParameters));
+			configParameters.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+			configParameters.swapChain = swapChain->swapChain;
+			
+			configParameters.frameGenerationEnabled = true;
+			configParameters.frameGenerationCallback = FrameGenerationCallback;
+			configParameters.frameGenerationCallbackUserContext = &frameGenContext;
+			
+			// Use AA result (upscaledColor) if AA was executed in ReplaceTAA, otherwise raw HUDLess
+			if (resourcesReady) {
+				configParameters.HUDLessColor = ffxApiGetResourceDX12(aaWasExecutedInTAA ? upscaledColor : HUDLessColor);
 			} else {
-				upscaleDispatch.jitterOffset.x = 0.0f;
-				upscaleDispatch.jitterOffset.y = 0.0f;
+				configParameters.HUDLessColor = FfxApiResource{};
 			}
-			upscaleDispatch.motionVectorScale.x = (float)swapChain->swapChainDesc.Width;
-			upscaleDispatch.motionVectorScale.y = (float)swapChain->swapChainDesc.Height;
-			upscaleDispatch.renderSize.width = swapChain->swapChainDesc.Width;
-			upscaleDispatch.renderSize.height = swapChain->swapChainDesc.Height;
-			upscaleDispatch.upscaleSize = upscaleDispatch.renderSize;
-			upscaleDispatch.frameTimeDelta = manualDeltaTime;
-			upscaleDispatch.cameraNear = cameraNearVal;
-			upscaleDispatch.cameraFar = cameraFarVal;
-			upscaleDispatch.cameraFovAngleVertical = GetVerticalFOVRad();
-			upscaleDispatch.viewSpaceToMetersFactor = 0.01428222656f;
-			upscaleDispatch.preExposure = 1.0f;
-			upscaleDispatch.reset = (frameID < 10);
-			upscaleDispatch.enableSharpening = true;
-			upscaleDispatch.sharpness = upscaling->settings.sharpness;
-			upscaleDispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
-
-			ffxDispatch(&upscaleContext, &upscaleDispatch.header);
-
-			D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(upscaledColor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-			commandList->ResourceBarrier(1, &barrier);
-		} else if (upscaledColor) {
-			D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(upscaledColor, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-			commandList->ResourceBarrier(1, &barrier);
+			
+			configParameters.frameID = frameID;
+			configParameters.onlyPresentGenerated = false;
+			configParameters.allowAsyncWorkloads = true;
+			configParameters.flags = 0;
+			configParameters.generationRect.left = 0;
+			configParameters.generationRect.top = 0;
+			configParameters.generationRect.width = swapChain->swapChainDesc.Width;
+			configParameters.generationRect.height = swapChain->swapChainDesc.Height;
+			
+			auto configResult = ffxConfigure(&frameGenContext, &configParameters.header);
+			if (configResult != FFX_API_RETURN_OK) {
+				logger::error("[FidelityFX] Failed to configure frame generation! Error: 0x{:X}", (uint32_t)configResult);
+			}
+			
+			// DIAGNOSTIC: Log Configure details every 300 frames
+			static uint64_t lastConfigLogFrame = 0;
+			if (frameID - lastConfigLogFrame >= 300) {
+				lastConfigLogFrame = frameID;
+				logger::info("[FidelityFX] Configure: swapChain={:p}, enabled={}, HUDLess={:p}, aaWasExecutedInTAA={}",
+					(void*)configParameters.swapChain,
+					configParameters.frameGenerationEnabled,
+					configParameters.HUDLessColor.resource,
+					aaWasExecutedInTAA);
+			}
 		}
 
-		// Dispatch PrepareV2
+		// ========================================================================
+		// STEP 4: Dispatch PrepareV2
+		// ========================================================================
 		ffxDispatchDescFrameGenerationPrepareV2 prepare{};
 		memset(&prepare, 0, sizeof(prepare));
 		prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
@@ -467,32 +484,147 @@ void FSR4SkyrimHandler::Present(bool a_useFrameGeneration, bool a_bypass)
 			}
 		}
 
-		// DIAGNOSTIC: Log Prepare details every 300 frames
-		static uint64_t lastPrepareLogFrame = 0;
-		if (frameID - lastPrepareLogFrame >= 300) {
-			lastPrepareLogFrame = frameID;
-			// Also log raw projectionPosScale to verify offset correctness
-			if (stateEx) {
-				logger::info("[FidelityFX] projectionPosScale: X={:.6f}, Y={:.6f}", 
-					stateEx->projectionPosScaleX, stateEx->projectionPosScaleY);
-			}
-			logger::info("[FidelityFX] PrepareV2: depth={:p}, motionVectors={:p}, mvScale=({:.1f},{:.1f}), jitter=({:.4f},{:.4f})",
-				(void*)prepare.depth.resource,
-				(void*)prepare.motionVectors.resource,
-				prepare.motionVectorScale.x, prepare.motionVectorScale.y,
-				prepare.jitterOffset.x, prepare.jitterOffset.y);
-			logger::info("[FidelityFX] PrepareV2: deltaTime={:.2f}ms, near={:.2f}, far={:.0f}, fov={:.4f}rad",
-				prepare.frameTimeDelta, prepare.cameraNear, prepare.cameraFar, prepare.cameraFovAngleVertical);
-			logger::info("[FidelityFX] PrepareV2: cameraPos=({:.1f},{:.1f},{:.1f}), reset={}",
-				prepare.cameraPosition[0], prepare.cameraPosition[1], prepare.cameraPosition[2], prepare.reset);
-		}
+		// Diagnostic logging disabled in release build
+		// Enable shouldLog above for debugging if needed
 
 		auto dispatchResult = ffxDispatch(&frameGenContext, &prepare.header);
 		if (dispatchResult != FFX_API_RETURN_OK) {
-			logger::error("[FidelityFX] PrepareV2 Dispatch failed! Error: 0x{:X}", (uint32_t)dispatchResult);
+			logger::error("[FSR4] PrepareV2 failed! Error: 0x{:X}", (uint32_t)dispatchResult);
 		}
-		if (shouldLog) logger::info("[FSR4_Skyrim] Dispatch Complete. ID: {}", frameID);
+		
+		// Anti-Lag 2.0: Mark end of main rendering work (after PrepareV2)
+		MarkEndOfRendering();
 	}
 
 	currentFSRFrameID++; // Increment for next frame
+}
+
+// ============================================================================
+// Synchronous AA Dispatch for TAA Replacement
+// Called from ReplaceTAA() in D3D11 hook context
+// ============================================================================
+bool FSR4SkyrimHandler::DispatchAASync(
+	ID3D12Resource* inputColor,
+	ID3D12Resource* outputColor,
+	ID3D12Resource* depth,
+	ID3D12Resource* motionVectors)
+{
+	if (!upscaleInitialized || !inputColor || !outputColor) {
+		logger::warn("[FidelityFX] DispatchAASync: Not initialized or missing resources");
+		return false;
+	}
+	
+	auto swapChain = DX12SwapChain::GetSingleton();
+	auto upscaling = Upscaling::GetSingleton();
+	
+	if (!swapChain || !upscaling) return false;
+	
+	// Get current command list
+	auto commandList = swapChain->commandLists[swapChain->frameIndex].get();
+	auto commandAllocator = swapChain->commandAllocators[swapChain->frameIndex].get();
+	
+	if (!commandList || !commandAllocator) {
+		logger::warn("[FidelityFX] DispatchAASync: Missing command list or allocator");
+		return false;
+	}
+	
+	// Get state for jitter
+	auto state = RE::BSGraphics::State::GetSingleton();
+	auto stateEx = state ? reinterpret_cast<StateEx*>(state) : nullptr;
+	
+	// Use game's deltaTime
+	static auto s_deltaTime = (float*)REL::RelocationID(523660, 410199).address();
+	float manualDeltaTime = s_deltaTime ? (*s_deltaTime * 1000.0f) : 16.6f;
+	if (manualDeltaTime <= 0.0f) manualDeltaTime = 16.6f;
+	
+	// Camera near/far
+	static auto s_cameraNear = (float*)(REL::RelocationID(517032, 403540).address() + 0x40);
+	static auto s_cameraFar = (float*)(REL::RelocationID(517032, 403540).address() + 0x44);
+	float cameraNearVal = s_cameraNear ? *s_cameraNear : 0.1f;
+	float cameraFarVal = s_cameraFar ? *s_cameraFar : 100000.0f;
+	if (cameraNearVal <= 0.0f) cameraNearVal = 0.1f;
+	if (cameraFarVal <= cameraNearVal) cameraFarVal = 100000.0f;
+	
+	bool shouldLog = false; // Release: Only log errors
+	
+	try {
+		// Reset command allocator and list for AA work
+		DX::ThrowIfFailed(commandAllocator->Reset());
+		DX::ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
+		
+		// Build AA dispatch descriptor
+		ffxDispatchDescUpscale upscaleDispatch{};
+		memset(&upscaleDispatch, 0, sizeof(upscaleDispatch));
+		upscaleDispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+		upscaleDispatch.commandList = commandList;
+		upscaleDispatch.color = ffxApiGetResourceDX12(inputColor);
+		upscaleDispatch.depth = ffxApiGetResourceDX12(depth);
+		upscaleDispatch.motionVectors = ffxApiGetResourceDX12(motionVectors);
+		upscaleDispatch.output = ffxApiGetResourceDX12(outputColor, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+		
+		// Read jitter from game state
+		if (stateEx) {
+			upscaleDispatch.jitterOffset.x = stateEx->projectionPosScaleX * (float)swapChain->swapChainDesc.Width / 2.0f;
+			upscaleDispatch.jitterOffset.y = stateEx->projectionPosScaleY * (float)swapChain->swapChainDesc.Height / 2.0f;
+		} else {
+			upscaleDispatch.jitterOffset.x = 0.0f;
+			upscaleDispatch.jitterOffset.y = 0.0f;
+		}
+		
+		upscaleDispatch.motionVectorScale.x = (float)swapChain->swapChainDesc.Width;
+		upscaleDispatch.motionVectorScale.y = (float)swapChain->swapChainDesc.Height;
+		upscaleDispatch.renderSize.width = swapChain->swapChainDesc.Width;
+		upscaleDispatch.renderSize.height = swapChain->swapChainDesc.Height;
+		upscaleDispatch.upscaleSize = upscaleDispatch.renderSize;  // Native res AA
+		upscaleDispatch.frameTimeDelta = manualDeltaTime;
+		upscaleDispatch.cameraNear = cameraNearVal;
+		upscaleDispatch.cameraFar = cameraFarVal;
+		upscaleDispatch.cameraFovAngleVertical = GetVerticalFOVRad();
+		upscaleDispatch.viewSpaceToMetersFactor = 0.01428222656f;
+		upscaleDispatch.preExposure = 1.0f;
+		upscaleDispatch.reset = needsReset || (currentFSRFrameID < 10);
+		upscaleDispatch.enableSharpening = true;
+		upscaleDispatch.sharpness = upscaling->settings.sharpness;
+		upscaleDispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+		
+		if (shouldLog) {
+			logger::info("[FSR4] AA: jitter=({:.4f},{:.4f})", upscaleDispatch.jitterOffset.x, upscaleDispatch.jitterOffset.y);
+		}
+		
+		// Execute AA dispatch
+		auto aaResult = ffxDispatch(&upscaleContext, &upscaleDispatch.header);
+		if (aaResult != FFX_API_RETURN_OK) {
+			logger::error("[FidelityFX] DispatchAASync: ffxDispatch failed! Error: 0x{:X}", (uint32_t)aaResult);
+			return false;
+		}
+		
+		// Transition output to readable state
+		D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+			outputColor, 
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 
+			D3D12_RESOURCE_STATE_COMMON  // COMMON allows D3D11 to read via shared handle
+		);
+		commandList->ResourceBarrier(1, &barrier);
+		
+		// Close and execute command list
+		DX::ThrowIfFailed(commandList->Close());
+		
+		ID3D12CommandList* commandListsToExecute[] = { commandList };
+		swapChain->commandQueue->ExecuteCommandLists(1, commandListsToExecute);
+		
+		// Signal D3D12 completion (D3D11 will wait on this)
+		swapChain->SignalD3D12ToD3D11();
+		
+		// Clear reset flag after successful dispatch
+		if (needsReset) needsReset = false;
+		
+		return true;
+		
+	} catch (const std::exception& e) {
+		logger::critical("[FidelityFX] DispatchAASync exception: {}", e.what());
+		return false;
+	} catch (...) {
+		logger::critical("[FidelityFX] DispatchAASync unknown exception!");
+		return false;
+	}
 }

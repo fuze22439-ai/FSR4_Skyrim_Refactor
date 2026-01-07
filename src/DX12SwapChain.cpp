@@ -84,9 +84,13 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory4* a_dxgiFactory, DXGI_SWAP_CHAI
 
 	logger::info("[FSR4SkyrimHandler] Attempting to create swap chain context...");
 	logger::info("[FSR4SkyrimHandler] HWND: {:p}, Width: {}, Height: {}, Format: {}", (void*)a_swapChainDesc.OutputWindow, swapChainDesc.Width, swapChainDesc.Height, (int)swapChainDesc.Format);
+	logger::info("[FSR4SkyrimHandler] BEFORE ffxCreateContext: swapChain ptr = {:p}", (void*)swapChain);
 
 	// Call the C API directly
 	auto ret = ffxCreateContext(&fidelityFX->swapChainContext, &ffxSwapChainDesc.header, nullptr);
+	
+	logger::info("[FSR4SkyrimHandler] AFTER ffxCreateContext: swapChain ptr = {:p}, ret = 0x{:X}", (void*)swapChain, (uint32_t)ret);
+	
 	if (ret != FFX_API_RETURN_OK) {
 		logger::critical("[FSR4SkyrimHandler] Failed to create swap chain context! Error code: 0x{:X}", (uint32_t)ret);
 	} else {
@@ -100,15 +104,27 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory4* a_dxgiFactory, DXGI_SWAP_CHAI
 		// DIAGNOSTIC: Verify SwapChain is FSR Proxy
 		// SDK uses this IID to detect if SwapChain is an FSR interpolation proxy
 		static const GUID IID_IFfxFrameInterpolationSwapChain = { 0xbeed74b2, 0x282e, 0x4aa3, {0xbb, 0xf7, 0x53, 0x45, 0x60, 0x50, 0x7a, 0x45} };
+		// Also check IFrameInterpolationSwapChainDX12 (used by FfxAbiFrameGenSwapChainCall)
+		static const GUID IID_IFrameInterpolationSwapChainDX12 = { 0x5f5fa2f5, 0x3bc5, 0x48d8, {0xa6, 0x3b, 0xe6, 0x03, 0x18, 0xe3, 0x80, 0x00} };
+		
 		void* testPtr = nullptr;
-		HRESULT qiResult = swapChain->QueryInterface(IID_IFfxFrameInterpolationSwapChain, &testPtr);
-		if (SUCCEEDED(qiResult)) {
+		HRESULT qiResult1 = swapChain->QueryInterface(IID_IFfxFrameInterpolationSwapChain, &testPtr);
+		logger::info("[DX12SwapChain] QueryInterface IID_IFfxFrameInterpolationSwapChain: 0x{:X}", (uint32_t)qiResult1);
+		if (testPtr) { ((IUnknown*)testPtr)->Release(); testPtr = nullptr; }
+		
+		HRESULT qiResult2 = swapChain->QueryInterface(IID_IFrameInterpolationSwapChainDX12, &testPtr);
+		logger::info("[DX12SwapChain] QueryInterface IID_IFrameInterpolationSwapChainDX12: 0x{:X}", (uint32_t)qiResult2);
+		if (testPtr) { ((IUnknown*)testPtr)->Release(); testPtr = nullptr; }
+		
+		// Also check standard DXGI interfaces to see what the object actually is
+		HRESULT qiResult3 = swapChain->QueryInterface(__uuidof(IDXGISwapChain4), &testPtr);
+		logger::info("[DX12SwapChain] QueryInterface IDXGISwapChain4: 0x{:X}", (uint32_t)qiResult3);
+		if (testPtr) { ((IUnknown*)testPtr)->Release(); testPtr = nullptr; }
+		
+		if (SUCCEEDED(qiResult1) || SUCCEEDED(qiResult2)) {
 			logger::info("[DX12SwapChain] GOOD: SwapChain IS an FSR Frame Interpolation Proxy!");
-			if (testPtr) {
-				((IUnknown*)testPtr)->Release();
-			}
 		} else {
-			logger::error("[DX12SwapChain] BAD: SwapChain is NOT an FSR Proxy! QueryInterface failed: 0x{:X}", (uint32_t)qiResult);
+			logger::error("[DX12SwapChain] BAD: SwapChain is NOT an FSR Proxy!");
 			logger::error("[DX12SwapChain] This means Configure will NOT enable interpolation on the SwapChain!");
 		}
 		
@@ -239,13 +255,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 
 	auto upscaling_ptr = Upscaling::GetSingleton();
-	bool shouldLog = (frameCounter < 200) || (frameCounter % 100 == 0);
-	
-	if (shouldLog) {
-		logger::info("[DX12SwapChain] Present Frame: {}, frameIndex: {}, setupBuffers: {}", 
-			frameCounter, frameIndex, upscaling_ptr->setupBuffers);
-		LOG_FLUSH();
-	}
+	(void)upscaling_ptr; // May be unused
 	frameCounter++;
 
 	// Core interop check - this is a hard requirement
@@ -254,8 +264,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return swapChain->Present(SyncInterval, Flags);
 	}
 
-	// Following ENBFrameGeneration: Call CopyBuffersToSharedResources before D3D11->D3D12 sync
-	upscaling_ptr->CopyBuffersToSharedResources();
+	// NOTE: CopyBuffersToSharedResources is now called from TAA hooks (ReplaceTAA or CopyBuffersToSharedResources)
+	// DO NOT call it here again - it would overwrite the pre-TAA data with post-TAA data!
+	// The TAA hook ensures data is collected at the correct moment in the rendering pipeline.
 
 	// D3D11 Signal -> D3D12 Wait
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
@@ -502,4 +513,48 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameStatistics(_Out_ DXGI_FRAM
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetLastPresentCount(_Out_ UINT* pLastPresentCount)
 {
 	return swapChain->GetLastPresentCount(pLastPresentCount);
+}
+
+// ============================================================================
+// D3D11 <-> D3D12 Synchronization Methods
+// Used by ReplaceTAA() for synchronous AA execution
+// ============================================================================
+
+void DX12SwapChain::SignalD3D11ToD3D12()
+{
+	// D3D11 signals fence, then D3D12 waits on same fence
+	// This notifies D3D12 that D3D11 data (HUDLess, MV, Depth) is ready
+	if (!d3d11Fence || !d3d12Fence || !d3d11Context || !commandQueue) {
+		logger::warn("[DX12SwapChain] SignalD3D11ToD3D12: Missing fence or queue");
+		return;
+	}
+	
+	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
+	fenceValue++;
+}
+
+void DX12SwapChain::SignalD3D12ToD3D11()
+{
+	// D3D12 signals fence (for D3D11 wait)
+	// Call this AFTER D3D12 command list execution
+	if (!d3d12Fence || !commandQueue) {
+		logger::warn("[DX12SwapChain] SignalD3D12ToD3D11: Missing fence or queue");
+		return;
+	}
+	
+	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
+}
+
+void DX12SwapChain::WaitForD3D12Completion()
+{
+	// D3D11 waits for D3D12 fence signal
+	// Call this AFTER SignalD3D12ToD3D11() to block until D3D12 work completes
+	if (!d3d11Fence || !d3d12Fence || !d3d11Context) {
+		logger::warn("[DX12SwapChain] WaitForD3D12Completion: Missing fence or context");
+		return;
+	}
+	
+	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
+	fenceValue++;
 }

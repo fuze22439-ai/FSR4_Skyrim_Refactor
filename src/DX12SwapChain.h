@@ -96,4 +96,10 @@ public:
 	HRESULT GetBuffer(void** ppSurface);
 	HRESULT Present(UINT SyncInterval, UINT Flags);
 	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
+	
+	// Synchronization methods for D3D11 <-> D3D12 interop
+	// Used by ReplaceTAA to wait for D3D12 AA completion before copying result back
+	void SignalD3D11ToD3D12();  // D3D11 signals fence, D3D12 waits
+	void WaitForD3D12Completion();  // D3D11 waits for D3D12 fence signal
+	void SignalD3D12ToD3D11();  // D3D12 signals fence (for D3D11 wait)
 };

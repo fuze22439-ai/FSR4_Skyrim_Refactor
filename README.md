@@ -1,45 +1,229 @@
-# FSR4_Skyrim_Refactor
+# ENB FSR 4.0
 
-AMD FSR 4.0 Frame Generation implementation for Skyrim Special Edition.
+<div align="center">
 
-为《上古卷轴5：特别版》实现的 AMD FSR 4.0 帧生成插件。采用 Proxy SwapChain 架构处理 D3D11 到 D3D12 的互操作。目前处于重构与优化阶段，旨在提供原生级的插帧体验。
+![FSR 4.0](https://img.shields.io/badge/AMD%20FSR-4.0%20ML-ED1C24?style=for-the-badge&logo=amd&logoColor=white)
+![Skyrim SE](https://img.shields.io/badge/Skyrim%20SE-1.5.97-5C2D91?style=for-the-badge)
+![SKSE](https://img.shields.io/badge/SKSE-Plugin-blue?style=for-the-badge)
+![License](https://img.shields.io/badge/License-GPL--3.0-green?style=for-the-badge)
 
-## 核心特性 (Core Features)
-- **FSR 4.0 原生支持**: 利用最新的 FidelityFX SDK 实现高质量插帧。
-- **Proxy SwapChain 架构**: 通过代理交换链技术，在 D3D11 游戏引擎中注入 D3D12 渲染管线。
-- **反向互操作 (Reverse Interop)**: 采用最稳定的 D3D12 资源共享方案，确保与 ENB 等插件的兼容性。
-- **精准同步**: 严格同步 FrameID 与相机抖动 (Jitter)，消除画面撕裂与拖影。
+**🎮 AMD FSR 4.0 Frame Generation for Skyrim Special Edition**
 
-## ⚠️ 当前核心问题 (Current Critical Issue)
-**目前插帧效果依然无效 (Interpolation Inactive)**。
-虽然 FSR 4.0 已成功加载且日志显示调度正常，但视觉上没有感知到流畅度提升。这可能是由于运动矢量 (Motion Vector) 极性、深度缓冲 (Depth) 兼容性或颜色空间不匹配导致的“静默回退”。**本项目目前仍处于攻克此问题的阶段。**
+[Features](#-功能特性) • [Requirements](#-系统要求) • [Installation](#-安装指南) • [Configuration](#️-配置说明) • [Credits](#-致谢)
 
-## 当前进度 (Current Progress)
-- [x] 基础 Proxy SwapChain 搭建
-- [x] FSR 4.0 上下文初始化
-- [x] 相机向量 (Camera Vectors) 映射修复
-- [x] Jitter 符号与缩放校正
-- [x] 资源屏障 (Resource Barriers) 优化
-- [ ] **待解决 (CRITICAL)**: 解决插帧无效/静默回退问题
-- [ ] **待解决**: 运动矢量 (Motion Vector) 极性与缩放微调
-- [ ] **待解决**: 深度缓冲 (Depth) 极性对齐 (Standard vs Inverted)
+</div>
 
-## 技术细节 (Technical Details)
-- **开发环境**: Visual Studio 2022, CMake, Vcpkg
-- **依赖库**: 
-  - AMD FidelityFX SDK (FSR 4.0)
-  - CommonLibSSE-NG
-  - Detours
-- **架构方案**: 
-  - 使用 **SKSE::PatchIAT** 挂钩 `D3D11CreateDeviceAndSwapChain`。
-  - 使用 **Detours VTable Hook** 挂钩 `IDXGIFactory::CreateSwapChain` 以注入代理交换链。
-  - 采用 **Reverse Interop** (D3D12 创建资源 -> D3D11 打开共享句柄)。
+---
 
-## 致谢 (Credits)
-参考并借鉴了以下项目的优秀实现：
-- [ENBFrameGeneration](https://github.com/doodlum/ENBFrameGeneration)
-- [enb-anti-aliasing](https://github.com/doodlum/enb-anti-aliasing)
-- [Skyrim-Upscaler](https://github.com/PureDark/Skyrim-Upscaler)
+## ✨ 功能特性
 
-## 免责声明 (Disclaimer)
-本项目仅用于技术研究与交流。请确保你拥有合法的游戏副本。
+### 🚀 FSR 4.0 帧生成 (Frame Generation)
+- **MLFI 技术**：利用 AMD Machine Learning Frame Interpolation 技术
+- **帧率翻倍**：在原生帧率基础上插入新帧，实现视觉帧率 ×2
+- **低延迟设计**：配合 Anti-Lag 2.0 技术最小化输入延迟
+
+### 🎨 FSR 4.0 抗锯齿 (Anti-Aliasing)
+- **替代原生 TAA**：使用 FSR 4.0 Upscaler（Native 模式）替代 Skyrim 的 TAA
+- **时序稳定**：保持帧生成所需的 Motion Vector 数据一致性
+- **画质提升**：相比原生 TAA 更清晰锐利
+
+### ⚡ AMD Anti-Lag 2.0
+- **输入延迟优化**：在帧生成启用时降低输入延迟
+- **智能帧标记**：区分真实帧与插值帧
+- **自动检测**：非 AMD GPU 自动禁用，不影响功能
+
+---
+
+## 💻 系统要求
+
+### 必须
+| 组件 | 要求 |
+|------|------|
+| **游戏版本** | Skyrim Special Edition 1.5.97 (SE) |
+| **SKSE** | SKSE64 2.0.20+ |
+| **显示模式** | 无边框窗口化 (Borderless Windowed) |
+| **显示器** | 推荐高刷新率 (120Hz+) |
+
+### 推荐
+| 组件 | 推荐配置 |
+|------|----------|
+| **GPU** | AMD RX 9000 系列（FSR 4.0 ML 帧生成）|
+| **显示器** | 240Hz VRR (FreeSync/G-Sync) |
+| **ENB** | 兼容 ENBSeries |
+
+> ⚠️ **重要硬件要求**：FSR 4.0 ML 帧生成（Machine Learning）**仅支持 AMD RX 9000 系列及更新显卡**。RX 7000 及更早的显卡将回退到软件实现或传统算法。
+
+---
+
+## 📦 安装指南
+
+### 方法 1：Mod Organizer 2（推荐）
+
+1. **下载发布包**
+2. **通过 MO2 安装**：将压缩包拖入 MO2 或使用「从文件安装」
+3. **启用 mod**
+4. **复制 DLL 文件**：
+   - 将 `amd_fidelityfx_loader_dx12.dll` 复制到游戏根目录
+   - 将 `amd_fidelityfx_framegeneration_dx12.dll` 复制到游戏根目录
+
+### 方法 2：手动安装
+
+```
+📁 Skyrim Special Edition/
+├── 📄 amd_fidelityfx_loader_dx12.dll      ← 复制到这里
+├── 📄 amd_fidelityfx_framegeneration_dx12.dll  ← 复制到这里
+└── 📁 Data/
+    └── 📁 SKSE/
+        └── 📁 Plugins/
+            └── 📄 FSR4_Skyrim.dll         ← 复制到这里
+```
+
+### 验证安装
+
+1. 启动游戏
+2. 打开 ENB 菜单 (Shift+Enter)
+3. 查看「FSR4 FRAME GENERATION」分组
+4. 确认状态显示「Status: ENABLED」
+
+---
+
+## ⚙️ 配置说明
+
+### ENB 菜单选项
+
+| 选项 | 说明 | 默认值 |
+|------|------|--------|
+| **Enable Frame Generation** | 开启/关闭帧生成 | ✅ 开启 |
+| **VRR Frame Pacing** | 可变刷新率帧同步 | ❌ 关闭 |
+| **Async Compute** | 异步计算优化 | ✅ 开启 |
+| **Sharpness** | 锐化强度 (0.0-1.0) | 0.5 |
+| **Force Enable (Low Hz)** | 低刷新率显示器强制启用 | ❌ 关闭 |
+| **Enable Anti-Lag 2.0** | AMD Anti-Lag 2.0 | ✅ 开启 |
+
+### 配置文件
+
+配置保存在 `enbseries/enbframegeneration.ini`：
+
+```ini
+[FRAME GENERATION]
+FrameGenerationMode=1
+FrameLimitMode=0
+ForceEnable=0
+Sharpness=0.5
+AllowAsyncWorkloads=1
+AntiLagEnabled=1
+```
+
+---
+
+## 🔧 故障排除
+
+### 常见问题
+
+<details>
+<summary><b>❓ 帧生成没有效果</b></summary>
+
+1. 确认使用**无边框窗口化**模式
+2. 检查 ENB 菜单中状态是否为「ENABLED」
+3. 确认 FSR DLL 文件已复制到游戏根目录
+4. 重启游戏使设置生效
+
+</details>
+
+<details>
+<summary><b>❓ 画面闪烁或撕裂</b></summary>
+
+1. 启用 VSync（在 ENB 或驱动中）
+2. 如果使用 SSE Display Tweaks，关闭「VRR Frame Pacing」选项
+3. 确保不要同时使用多个帧率限制
+
+</details>
+
+<details>
+<summary><b>❓ Anti-Lag 显示「Not Available」</b></summary>
+
+Anti-Lag 2.0 仅支持 AMD GPU + 最新驱动。非 AMD 显卡会自动显示不可用，这不影响帧生成功能。
+
+</details>
+
+<details>
+<summary><b>❓ 与 ENB 冲突</b></summary>
+
+本 mod 设计与 ENB 完全兼容。如遇问题：
+1. 确保使用最新版 ENB
+2. 检查 ENB 日志是否有错误
+3. 暂时禁用其他 SKSE 插件测试
+
+</details>
+
+### 日志文件
+
+日志位置：`Documents/My Games/Skyrim Special Edition/SKSE/FSR4_Skyrim.log`
+
+---
+
+## 🏗️ 技术架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Skyrim SE (D3D11)                        │
+├─────────────────────────────────────────────────────────────┤
+│  TAA Hook                                                    │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
+│  │ Pre-TAA     │───▶│ FSR 4.0 AA  │───▶│ Post-AA     │     │
+│  │ Color       │    │ (D3D12)     │    │ Color       │     │
+│  └─────────────┘    └─────────────┘    └─────────────┘     │
+│         │                  ▲                  │              │
+│         ▼                  │                  ▼              │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
+│  │ Motion Vec  │───▶│ D3D11/D3D12 │◀───│ Depth       │     │
+│  │             │    │ Interop     │    │ Buffer      │     │
+│  └─────────────┘    └─────────────┘    └─────────────┘     │
+├─────────────────────────────────────────────────────────────┤
+│  Present Hook (D3D12 Proxy SwapChain)                       │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
+│  │ AA Output   │───▶│ FSR 4.0 FG  │───▶│ Interpolated│     │
+│  │ (HUDLess)   │    │ PrepareV2   │    │ Frame       │     │
+│  └─────────────┘    └─────────────┘    └─────────────┘     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 关键技术
+
+- **Proxy SwapChain**：使用 D3D12 代理交换链，避免 Double Present
+- **D3D11/D3D12 Interop**：通过共享纹理和 Fence 实现跨 API 数据共享
+- **同步 AA**：在 TAA Hook 中同步执行 AA，确保 MV 与画面数据一致
+
+---
+
+## 🙏 致谢
+
+### 核心参考
+- **[doodlum](https://github.com/doodlum)** - [ENBFrameGeneration](https://github.com/doodlum/ENBFrameGeneration) & [enb-anti-aliasing](https://github.com/doodlum/enb-anti-aliasing)
+  - 本项目的架构设计和 Hook 策略完全参考自 doodlum 的实现
+  - 是 Skyrim 帧生成领域的先驱和行业标准
+
+### 技术支持
+- **AMD** - [FidelityFX SDK](https://github.com/GPUOpen-Effects/FidelityFX-SDK)
+- **SKSE Team** - [Skyrim Script Extender](https://skse.silverlock.org/)
+- **CommonLibSSE-NG** - 现代化 Skyrim modding 框架
+
+### 特别感谢
+- Boris Vorontsov - ENBSeries
+- Skyrim modding 社区
+
+---
+
+## 📄 许可证
+
+本项目采用 [GPL-3.0 License](LICENSE) 开源许可证。
+
+---
+
+<div align="center">
+
+**Made with ❤️ for the Skyrim modding community**
+
+[⬆ 返回顶部](#fsr-40-frame-generation-for-skyrim-se)
+
+</div>

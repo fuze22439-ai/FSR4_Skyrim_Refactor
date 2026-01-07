@@ -13,6 +13,9 @@
 #include <dx12/ffx_api_framegeneration_dx12.h>
 #include <dx12/ffx_api_framegeneration_dx12.hpp>
 
+// AMD Anti-Lag 2.0 SDK
+#include <amd/antilag2/ffx_antilag2_dx12.h>
+
 class FSR4SkyrimHandler
 {
 public:
@@ -37,10 +40,28 @@ public:
 	// Reset flag for scene transitions (load game, fast travel, etc.)
 	bool needsReset = true;  // Start with reset to handle initial frames
 	
+	// Anti-Lag 2.0
+	AMD::AntiLag2DX12::Context antiLagContext = {};
+	bool antiLagAvailable = false;
+	bool antiLagEnabled = true;  // User setting
+	
 	void RequestReset() { needsReset = true; }
 
 	void LoadFFX();
 	void SetupFrameGeneration();
+	void InitAntiLag(ID3D12Device* device);
+	void UpdateAntiLag();  // Call before input polling
+	void MarkEndOfRendering();  // Call after PrepareV2
+	void SetFrameType(bool isInterpolated);  // Call before Present
 	void Present(bool a_useFrameGeneration, bool a_bypass = false);
+	
+	// Synchronous AA dispatch for TAA replacement
+	// Called from ReplaceTAA() in D3D11 context, blocks until D3D12 AA completes
+	// Returns true if AA was executed successfully
+	bool DispatchAASync(
+		ID3D12Resource* inputColor,      // HUDLessBufferShared->resource (AA input)
+		ID3D12Resource* outputColor,     // upscaledBufferShared->resource (AA output)
+		ID3D12Resource* depth,           // depthBufferShared->resource
+		ID3D12Resource* motionVectors    // motionVectorBufferShared->resource
+	);
 };
-

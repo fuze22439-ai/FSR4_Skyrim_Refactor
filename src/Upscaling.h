@@ -45,6 +45,7 @@ public:
 		uint32_t frameGenerationForceEnable = 0;
 		float sharpness = 0.5f;
 		uint32_t allowAsyncWorkloads = 1;
+		uint32_t antiLagEnabled = 1;  // AMD Anti-Lag 2.0
 	};
 
 	Settings settings;
@@ -61,6 +62,9 @@ public:
 	WrappedResource* upscaledBufferShared = nullptr;
 	WrappedResource* depthBufferShared = nullptr;
 	WrappedResource* motionVectorBufferShared = nullptr;
+	
+	// TAA pre-pass Color buffer (color before TAA processing)
+	WrappedResource* preTaaColorShared = nullptr;
 
 	ID3D11ComputeShader* copyDepthToSharedBufferCS;
 
@@ -71,6 +75,10 @@ public:
 	
 	// Thread-safe flag for resource invalidation during game state changes (Load/New/DataLoaded)
 	std::atomic<bool> resourcesInvalidated{ false };
+	
+	// TAA Replacement Mode: true = skip native TAA and use FSR4 AA
+	// When enabled, ReplaceTAA() will execute FSR4 AA on D3D12 and copy result back
+	bool skipTaaEnabled = true;  // ENABLED: Use FSR4 AA to replace native TAA
 
 	struct Jitter
 	{
@@ -85,6 +93,7 @@ public:
 	void InvalidateResources();
 	void EarlyCopyBuffersToSharedResources();
 	void CopyBuffersToSharedResources();
+	void ReplaceTAA();  // New: TAA replacement function (like enb-anti-aliasing's Upscale)
 	void PostDisplay();
 
 	static void TimerSleepQPC(int64_t targetQPC);
@@ -118,10 +127,20 @@ public:
 		static void thunk(RE::BSImagespaceShaderISTemporalAA* a_shader, RE::BSTriShape* a_null)
 		{
 			auto singleton = GetSingleton();
-			if (singleton->validTaaPass) {
-				singleton->CopyBuffersToSharedResources();
+			
+			// Following enb-anti-aliasing: Skip native TAA if we're using FSR4 AA
+			// This ensures MV/Depth/Color all come from the same rendering moment
+			if (singleton->skipTaaEnabled && singleton->validTaaPass) {
+				// Execute our TAA replacement (data collection for FSR4)
+				singleton->ReplaceTAA();
+				// DO NOT call func() - skip native TAA entirely!
+			} else {
+				// Fallback: Use native TAA
+				if (singleton->validTaaPass) {
+					singleton->CopyBuffersToSharedResources();
+				}
+				func(a_shader, a_null);
 			}
-			func(a_shader, a_null);
 			singleton->validTaaPass = false;
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
