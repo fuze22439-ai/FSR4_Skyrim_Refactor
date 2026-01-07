@@ -62,20 +62,20 @@
 1. **下载发布包**
 2. **通过 MO2 安装**：将压缩包拖入 MO2 或使用「从文件安装」
 3. **启用 mod**
-4. **复制 DLL 文件**：
-   - 将 `amd_fidelityfx_loader_dx12.dll` 复制到游戏根目录
-   - 将 `amd_fidelityfx_framegeneration_dx12.dll` 复制到游戏根目录
+4. **完成！** 所有文件会自动部署到正确位置
 
 ### 方法 2：手动安装
 
 ```
-📁 Skyrim Special Edition/
-├── 📄 amd_fidelityfx_loader_dx12.dll      ← 复制到这里
-├── 📄 amd_fidelityfx_framegeneration_dx12.dll  ← 复制到这里
-└── 📁 Data/
-    └── 📁 SKSE/
-        └── 📁 Plugins/
-            └── 📄 FSR4_Skyrim.dll         ← 复制到这里
+📁 Data/
+└── 📁 SKSE/
+    └── 📁 Plugins/
+        ├── 📄 FSR4_Skyrim.dll
+        ├── 📄 CopyDepthToSharedBufferCS.hlsl
+        └── 📁 FSR4_Skyrim/
+            ├── 📄 amd_fidelityfx_loader_dx12.dll
+            ├── 📄 amd_fidelityfx_framegeneration_dx12.dll
+            └── 📄 amd_fidelityfx_upscaler_dx12.dll
 ```
 
 ### 验证安装
